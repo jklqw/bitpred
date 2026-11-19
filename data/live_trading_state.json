@@ -1,0 +1,217 @@
+{
+  "last_update_utc": "2026-11-19T10:49:31.459684+00:00",
+  "latest_live_price": 63826.065,
+  "alerts": [],
+  "periods": {
+    "3h": {
+      "balance_usdt": 999.0,
+      "total_realized_pnl_usdt": 0.0,
+      "total_fees_paid_usdt": 1.0,
+      "is_liquidated": false,
+      "active_trade": {
+        "trade_id": "3h-1795078094",
+        "direction": "LONG",
+        "market_price_at_entry": 63511.675,
+        "entry_price": 63518.0261675,
+        "liquidation_price": 48908.880148975004,
+        "target_price": 63539.186167500004,
+        "margin_usdt": 999.0,
+        "position_notional_usdt": 3996.0,
+        "position_qty_btc": 0.06291127481610277,
+        "fee_usdt": 1.0,
+        "start_time": "2026-11-19T08:48:14.420825+00:00",
+        "end_time": "2026-11-19T11:48:14.420825+00:00",
+        "opened_at_exact": "2026-11-19 08:48:14 UTC",
+        "opened_at_local": "2026-11-19 12:18:14 +0330",
+        "end_at_exact": "2026-11-19 11:48:14 UTC",
+        "confidence": "High Conviction",
+        "prob_up": 83.6,
+        "prob_down": 16.4,
+        "hit_probability_pct": 83.6,
+        "expected_delta_usd": 21.16
+      },
+      "last_signal_direction": "LONG",
+      "last_signal_hit_prob": 85.9,
+      "live_hit_prob": 85.9,
+      "live_prob_up": 85.9,
+      "live_prob_down": 14.1,
+      "live_confidence": "High Conviction",
+      "active_alert": null,
+      "trade_history": [],
+      "equity_history": [
+        {
+          "timestamp": "11-19 08:48",
+          "equity_usdt": 1000.0
+        }
+      ]
+    },
+    "6h": {
+      "balance_usdt": 999.0,
+      "total_realized_pnl_usdt": 0.0,
+      "total_fees_paid_usdt": 1.0,
+      "is_liquidated": false,
+      "active_trade": {
+        "trade_id": "6h-1795078094",
+        "direction": "LONG",
+        "market_price_at_entry": 63511.675,
+        "entry_price": 63518.0261675,
+        "liquidation_price": 48908.880148975004,
+        "target_price": 63834.2561675,
+        "margin_usdt": 999.0,
+        "position_notional_usdt": 3996.0,
+        "position_qty_btc": 0.06291127481610277,
+        "fee_usdt": 1.0,
+        "start_time": "2026-11-19T08:48:14.420825+00:00",
+        "end_time": "2026-11-19T14:48:14.420825+00:00",
+        "opened_at_exact": "2026-11-19 08:48:14 UTC",
+        "opened_at_local": "2026-11-19 12:18:14 +0330",
+        "end_at_exact": "2026-11-19 14:48:14 UTC",
+        "confidence": "High Conviction",
+        "prob_up": 82.2,
+        "prob_down": 17.8,
+        "hit_probability_pct": 82.2,
+        "expected_delta_usd": 316.23
+      },
+      "last_signal_direction": "LONG",
+      "last_signal_hit_prob": 77.2,
+      "live_hit_prob": 77.2,
+      "live_prob_up": 77.2,
+      "live_prob_down": 22.8,
+      "live_confidence": "High Conviction",
+      "active_alert": null,
+      "trade_history": [],
+      "equity_history": [
+        {
+          "timestamp": "11-19 08:48",
+          "equity_usdt": 1000.0
+        }
+      ]
+    },
+    "12h": {
+      "balance_usdt": 999.0,
+      "total_realized_pnl_usdt": 0.0,
+      "total_fees_paid_usdt": 1.0,
+      "is_liquidated": false,
+      "active_trade": {
+        "trade_id": "12h-1795078094",
+        "direction": "LONG",
+        "market_price_at_entry": 63511.675,
+        "entry_price": 63518.0261675,
+        "liquidation_price": 48908.880148975004,
+        "target_price": 63631.6561675,
+        "margin_usdt": 999.0,
+        "position_notional_usdt": 3996.0,
+        "position_qty_btc": 0.06291127481610277,
+        "fee_usdt": 1.0,
+        "start_time": "2026-11-19T08:48:14.420825+00:00",
+        "end_time": "2026-11-19T20:48:14.420825+00:00",
+        "opened_at_exact": "2026-11-19 08:48:14 UTC",
+        "opened_at_local": "2026-11-19 12:18:14 +0330",
+        "end_at_exact": "2026-11-19 20:48:14 UTC",
+        "confidence": "High Conviction",
+        "prob_up": 72.9,
+        "prob_down": 27.1,
+        "hit_probability_pct": 72.9,
+        "expected_delta_usd": 113.63
+      },
+      "last_signal_direction": "LONG",
+      "last_signal_hit_prob": 80.5,
+      "live_hit_prob": 80.5,
+      "live_prob_up": 80.5,
+      "live_prob_down": 19.5,
+      "live_confidence": "High Conviction",
+      "active_alert": null,
+      "trade_history": [],
+      "equity_history": [
+        {
+          "timestamp": "11-19 08:48",
+          "equity_usdt": 1000.0
+        }
+      ]
+    },
+    "1d": {
+      "balance_usdt": 999.0,
+      "total_realized_pnl_usdt": 0.0,
+      "total_fees_paid_usdt": 1.0,
+      "is_liquidated": false,
+      "active_trade": {
+        "trade_id": "1d-1795078094",
+        "direction": "LONG",
+        "market_price_at_entry": 63511.675,
+        "entry_price": 63518.0261675,
+        "liquidation_price": 48908.880148975004,
+        "target_price": 63848.1561675,
+        "margin_usdt": 999.0,
+        "position_notional_usdt": 3996.0,
+        "position_qty_btc": 0.06291127481610277,
+        "fee_usdt": 1.0,
+        "start_time": "2026-11-19T08:48:14.420825+00:00",
+        "end_time": "2026-11-20T08:48:14.420825+00:00",
+        "opened_at_exact": "2026-11-19 08:48:14 UTC",
+        "opened_at_local": "2026-11-19 12:18:14 +0330",
+        "end_at_exact": "2026-11-20 08:48:14 UTC",
+        "confidence": "High Conviction",
+        "prob_up": 64.7,
+        "prob_down": 35.3,
+        "hit_probability_pct": 64.7,
+        "expected_delta_usd": 330.13
+      },
+      "last_signal_direction": "LONG",
+      "last_signal_hit_prob": 65.7,
+      "live_hit_prob": 65.7,
+      "live_prob_up": 65.7,
+      "live_prob_down": 34.3,
+      "live_confidence": "High Conviction",
+      "active_alert": null,
+      "trade_history": [],
+      "equity_history": [
+        {
+          "timestamp": "11-19 08:48",
+          "equity_usdt": 1000.0
+        }
+      ]
+    },
+    "3d": {
+      "balance_usdt": 997.0,
+      "total_realized_pnl_usdt": 0.0,
+      "total_fees_paid_usdt": 3.0,
+      "is_liquidated": false,
+      "active_trade": {
+        "trade_id": "3d-1795078094",
+        "direction": "SHORT",
+        "market_price_at_entry": 63511.675,
+        "entry_price": 63505.323832500006,
+        "liquidation_price": 78111.548313975,
+        "target_price": 62341.5238325,
+        "margin_usdt": 997.0,
+        "position_notional_usdt": 3988.0,
+        "position_qty_btc": 0.06279788463906814,
+        "fee_usdt": 3.0,
+        "start_time": "2026-11-19T08:48:14.420825+00:00",
+        "end_time": "2026-11-22T08:48:14.420825+00:00",
+        "opened_at_exact": "2026-11-19 08:48:14 UTC",
+        "opened_at_local": "2026-11-19 12:18:14 +0330",
+        "end_at_exact": "2026-11-22 08:48:14 UTC",
+        "confidence": "High Conviction",
+        "prob_up": 38.1,
+        "prob_down": 61.9,
+        "hit_probability_pct": 61.9,
+        "expected_delta_usd": -1163.8
+      },
+      "last_signal_direction": "SHORT",
+      "last_signal_hit_prob": 56.7,
+      "live_hit_prob": 56.7,
+      "live_prob_up": 43.3,
+      "live_prob_down": 56.7,
+      "live_confidence": "High Conviction",
+      "active_alert": null,
+      "trade_history": [],
+      "equity_history": [
+        {
+          "timestamp": "11-19 08:48",
+          "equity_usdt": 1000.0
+        }
+      ]
+    }
+  }
+}
