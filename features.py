@@ -41,6 +41,48 @@ def extract_raw_dataframes(db_path: Optional[str] = None) -> Tuple[pd.DataFrame,
     return news_df, btc_df
 
 
+def extract_btc_dataframe(db_path: Optional[str] = None) -> pd.DataFrame:
+    """Load only BTC candles (used by the memory-efficient X-period path)."""
+    target_path = db_path or str(DB_PATH)
+    conn = sqlite3.connect(target_path)
+    btc_df = pd.read_sql_query("""
+        SELECT timestamp, open, high, low, close, volume, quote_volume, trades_count
+        FROM btc_prices
+        ORDER BY timestamp ASC;
+    """, conn)
+    conn.close()
+    if not btc_df.empty:
+        btc_df["timestamp"] = pd.to_datetime(btc_df["timestamp"], utc=True)
+    return btc_df
+
+
+def extract_news_hourly(db_path: Optional[str] = None) -> pd.DataFrame:
+    """Aggregate news to hourly buckets in SQL instead of loading every article.
+
+    A multi-year backfill can contain millions of articles, but the X-period
+    model only needs hourly tone/count aggregates. Doing this in SQLite keeps
+    training memory bounded to a few thousand rows instead of millions.
+    """
+    target_path = db_path or str(DB_PATH)
+    conn = sqlite3.connect(target_path)
+    hourly = pd.read_sql_query("""
+        SELECT strftime('%Y-%m-%d %H:00:00', timestamp) AS hour,
+               COUNT(*) AS n_count,
+               AVG(avg_tone) AS avg_tone,
+               AVG(positive_score) AS pos,
+               AVG(negative_score) AS neg,
+               AVG(polarity) AS pol
+        FROM news_articles
+        GROUP BY hour
+        ORDER BY hour ASC;
+    """, conn)
+    conn.close()
+    if hourly.empty:
+        return hourly
+    hourly.index = pd.DatetimeIndex(pd.to_datetime(hourly["hour"], utc=True), name="timestamp")
+    return hourly.fillna(0.0)
+
+
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     """Calculate Relative Strength Index without lookahead bias."""
     delta = series.diff()
@@ -131,6 +173,14 @@ def aggregate_news_features(news_df: pd.DataFrame, freq: str = "1h") -> pd.DataF
             news_features[f"share_{cat}"] = (
                 news_features[vol_col] / (news_features["total_news_volume"] + 1e-6)
             )
+
+    # Expand to every hourly bucket so rolling/EMA windows span real elapsed hours.
+    full_index = pd.date_range(
+        start=news_features.index.min(),
+        end=news_features.index.max(),
+        freq=freq
+    )
+    news_features = news_features.reindex(full_index).fillna(0.0)
 
     # 3. Rolling & Exponential Sentiment Decay Features
     news_features["news_vol_rolling_6h"] = news_features["total_news_volume"].rolling(6, min_periods=1).sum()
@@ -290,7 +340,9 @@ def build_ml_dataset(
 
     if not news_df.empty:
         news_features = aggregate_news_features(news_df, freq=freq)
-        merged = btc_features.join(news_features, how="left").fillna(0.0)
+        news_cols = news_features.columns.difference(btc_features.columns)
+        merged = btc_features.join(news_features, how="left")
+        merged[news_cols] = merged[news_cols].fillna(0.0)
     else:
         merged = btc_features
 
@@ -394,7 +446,7 @@ def extract_x_period_features_for_window(
     ret_q2 = (p_curr_close - p_q1_close) / (p_q1_close + 1e-9)
     accel_curr = ret_q2 - ret_q1
     vol_q1 = float(btc_df['volume'].iloc[idx_start:idx_q1+1].sum())
-    vol_q2 = float(btc_df['volume'].iloc[idx_q1:idx_mid+1].sum())
+    vol_q2 = float(btc_df['volume'].iloc[idx_q1+1:idx_mid+1].sum())
     vol_trend_curr = (vol_q2 + 1.0) / (vol_q1 + 1.0)
 
     # VWAP Window 1
@@ -554,7 +606,7 @@ def build_x_period_dataset(
     - Target: Price(end of X days) - Price(start of X day) = Close(T_end) - Open(T_start)
     - Prediction time: Close of candle at T_start + round(X * 12)h
     """
-    news_df, btc_df = extract_raw_dataframes(db_path)
+    btc_df = extract_btc_dataframe(db_path)
 
     if btc_df.empty:
         raise ValueError("BTC price table is empty. Fetch BTC data first.")
@@ -598,18 +650,8 @@ def build_x_period_dataset(
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     btc_df['btc_natr_14'] = (tr.rolling(14, min_periods=14).mean() / (close + 1e-9)) * 100.0
 
-    # 2. Pre-index news by hourly buckets
-    if not news_df.empty:
-        news_df['hour'] = news_df['timestamp'].dt.floor('1h')
-        news_hourly = news_df.groupby('hour').agg(
-            n_count=('avg_tone', 'count'),
-            avg_tone=('avg_tone', 'mean'),
-            pos=('positive_score', 'mean'),
-            neg=('negative_score', 'mean'),
-            pol=('polarity', 'mean')
-        ).fillna(0.0)
-    else:
-        news_hourly = pd.DataFrame()
+    # 2. Hourly news aggregates (computed in SQL to bound memory usage)
+    news_hourly = extract_news_hourly(db_path)
 
     # 3. Slide through candles and extract period records
     times = btc_df.index

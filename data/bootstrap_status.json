@@ -1,0 +1,35 @@
+{
+  "phase": "news_backfill",
+  "started_at": "2026-11-20T08:20:49.177213+00:00",
+  "updated_at": "2026-11-20T08:22:14.052925+00:00",
+  "config": {
+    "btc_years": 2,
+    "news_days": 730,
+    "news_source": "export",
+    "news_interval_hours": 6,
+    "news_workers": 8,
+    "force_train": false
+  },
+  "database": "/home/vbnm/Downloads/archive/bitpred/data/crypto_news_alpha.db",
+  "btc": {
+    "date_start": "2024-11-19 20:00:00",
+    "date_end": "2026-11-20 07:00:00",
+    "inserted_or_updated": 17532,
+    "requested_candles": 17532
+  },
+  "news": {},
+  "training": {},
+  "error": null,
+  "database_stats": {
+    "total_news": 931595,
+    "news_date_range": [
+      "2024-11-20 11:45:00",
+      "2026-11-20 06:15:00"
+    ],
+    "btc_price_count": 17533,
+    "btc_date_range": [
+      "2024-11-19 19:00:00",
+      "2026-11-20 07:00:00"
+    ]
+  }
+}

@@ -18,14 +18,16 @@ CATEGORY_PATTERNS = {
         r"\brate cut\b", r"\brate hike\b", r"\bquantitative easing\b", r"\bquantitative tightening\b",
         r"\bcentral bank\b", r"\binflation\b", r"\bcpi\b", r"\bpce\b", r"\bcore pce\b",
         r"\bmonetary policy\b", r"\bliquidity\b", r"\byield curve\b", r"\becb\b",
-        r"\bbank of japan\b", r"\bbank of england\b", r"\bdiscount rate\b"
+        r"\bbank of japan\b", r"\bbank of england\b", r"\bdiscount rate\b",
+        r"\becon[_ ,-]*inflation\b", r"\bepu[_ ,-]*policy\b", r"\bmonetary\b"
     ],
     "Regulation_Legal": [
         r"\bsec\b", r"\bgensler\b", r"\bcftc\b", r"\bregulat(or|ory|ion|ions)\b",
         r"\blawsuit\b", r"\bsubpoena\b", r"\bsanction(s)?\b", r"\banti-money laundering\b",
         r"\baml\b", r"\bkyc\b", r"\bsecurities and exchange commission\b",
         r"\bdepartment of justice\b", r"\bdoj\b", r"\betf approval\b", r"\betf denial\b",
-        r"\bfinra\b", r"\binsider trading\b", r"\bclass action\b"
+        r"\bfinra\b", r"\binsider trading\b", r"\bclass action\b",
+        r"\bwb[_ ,-]*justice\b", r"\btax[_ ,-]*fncact\b"
     ],
     "Macroeconomics": [
         r"\bgdp\b", r"\brecession\b", r"\bunemployment\b", r"\bnon-farm payroll(s)?\b",
@@ -42,7 +44,8 @@ CATEGORY_PATTERNS = {
     "Tech_Cybersecurity": [
         r"\bcyberattack\b", r"\bhack(ed|er|ing|s)?\b", r"\bransomware\b", r"\bexploit\b",
         r"\bdata breach\b", r"\bartificial intelligence\b", r"\bsemiconductor(s)?\b",
-        r"\bquantum computing\b", r"\bcloud outage\b", r"\bmalware\b", r"\bzero-day\b"
+        r"\bquantum computing\b", r"\bcloud outage\b", r"\bmalware\b", r"\bzero-day\b",
+        r"\bcyber\b", r"\bcybersecurity\b"
     ],
     "Energy_Commodities": [
         r"\bcrude oil\b", r"\bbrent\b", r"\bwti\b", r"\bopec\b", r"\bnatural gas\b",
@@ -74,7 +77,10 @@ def classify_article(
     Classify a news article into a primary category and secondary tags.
     Crypto is evaluated first to ensure crypto-regulatory/macro news is prioritized for BTC modeling.
     """
-    search_text = f"{url} {title or ''} {orgs or ''} {themes or ''}".lower()
+    # GDELT theme codes are underscore/comma-delimited (e.g. ECON_INFLATION,EPU_POLICY).
+    # A tokenized copy lets word-boundary rules match the individual code words too.
+    theme_tokens = re.sub(r"[,_\-\s]+", " ", themes or "")
+    search_text = f"{url} {title or ''} {orgs or ''} {themes or ''} {theme_tokens}".lower()
     
     matched_categories = []
     for category, patterns in COMPILED_RULES.items():

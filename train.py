@@ -1,11 +1,13 @@
 """Machine Learning Training, Walk-Forward Validation, Ensemble Modeling, and Realistic Backtesting."""
 
 import os
-import joblib
+import time
 import warnings
+from typing import Dict, Any, Tuple, List, Optional
+
+import joblib
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Tuple, List, Optional
 
 from config import (
     DATA_DIR,
@@ -14,11 +16,20 @@ from config import (
     DEFAULT_PREDICTION_HORIZON,
     DEFAULT_TARGET_THRESHOLD,
     DEFAULT_TAKER_FEE,
-    DEFAULT_SLIPPAGE
+    DEFAULT_SLIPPAGE,
+    LIVE_PERIOD_X_DAYS
 )
 from features import build_ml_dataset, diagnose_feature_coverage
 
 MODEL_ARTIFACT_PATH = DATA_DIR / "best_prediction_model.joblib"
+
+
+def atomic_joblib_dump(obj: Any, path) -> None:
+    """Write a model artifact atomically so live inference never loads a partial file."""
+    target = os.fspath(path)
+    tmp_path = f"{target}.tmp"
+    joblib.dump(obj, tmp_path)
+    os.replace(tmp_path, target)
 
 
 def prepare_features_and_targets(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series, list]:
@@ -47,19 +58,33 @@ def chronological_split(
     y: pd.Series,
     y_ret: pd.Series,
     train_ratio: float = 0.70,
-    val_ratio: float = 0.15
+    val_ratio: float = 0.15,
+    embargo_hours: int = 0
 ) -> Dict[str, Any]:
     """
     Strict 3-way chronological split without shuffling:
     [ Train (70%) ] -> [ Validation (15%) ] -> [ Untouched Test (15%) ]
+
+    embargo_hours drops the last N rows of train and validation (hourly samples)
+    so forward-looking labels cannot extend into the following partition.
     """
     n = len(X)
     train_end = int(n * train_ratio)
     val_end = int(n * (train_ratio + val_ratio))
 
+    embargo = max(0, int(embargo_hours))
+    train_embargo = max(0, min(embargo, train_end))
+    val_embargo = max(0, min(embargo, val_end - train_end))
+    if embargo > 0:
+        print(f"[*] Label embargo: dropping {train_embargo} train rows and {val_embargo} validation rows "
+              f"({embargo}h horizon).")
+
+    train_stop = train_end - train_embargo
+    val_stop = val_end - val_embargo
+
     return {
-        "X_train": X.iloc[:train_end], "y_train": y.iloc[:train_end], "ret_train": y_ret.iloc[:train_end],
-        "X_val": X.iloc[train_end:val_end], "y_val": y.iloc[train_end:val_end], "ret_val": y_ret.iloc[train_end:val_end],
+        "X_train": X.iloc[:train_stop], "y_train": y.iloc[:train_stop], "ret_train": y_ret.iloc[:train_stop],
+        "X_val": X.iloc[train_end:val_stop], "y_val": y.iloc[train_end:val_stop], "ret_val": y_ret.iloc[train_end:val_stop],
         "X_test": X.iloc[val_end:], "y_test": y.iloc[val_end:], "ret_test": y_ret.iloc[val_end:]
     }
 
@@ -114,16 +139,24 @@ def realistic_backtest(
     returns: pd.Series,
     signals: np.ndarray,
     taker_fee: float = DEFAULT_TAKER_FEE,
-    slippage: float = DEFAULT_SLIPPAGE
+    slippage: float = DEFAULT_SLIPPAGE,
+    stride: int = 1,
+    periods_per_year: Optional[float] = None
 ) -> Dict[str, float]:
     """
     Simulate realistic trading strategy with transaction fees, slippage, and execution timing.
     - Signal S_t in {0, 1} enters at t+1 Open.
     - Transaction cost applied on position entry AND exit: fee + slippage per side.
+    - stride downsamples aligned (returns, signals) to non-overlapping trades for multi-horizon targets.
+    - periods_per_year defaults to 8760 / stride (hourly samples); callers may override it.
     """
+    stride = max(1, int(stride))
+    if periods_per_year is None:
+        periods_per_year = 8760.0 / stride
+
     cost_per_side = taker_fee + slippage
-    signals = np.asarray(signals, dtype=float)
-    ret_arr = returns.values
+    signals = np.asarray(signals, dtype=float)[::stride]
+    ret_arr = np.asarray(returns.values if hasattr(returns, "values") else returns, dtype=float)[::stride]
 
     # Position turnover
     position_changes = np.abs(np.diff(signals, prepend=0.0))
@@ -145,10 +178,10 @@ def realistic_backtest(
     drawdowns = (peaks - cum_curve) / (peaks + 1e-9)
     max_mdd = float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
 
-    # Annualized Sharpe (hourly = sqrt(8760))
+    # Annualized Sharpe (hourly = sqrt(8760 / stride), unless overridden)
     mean_ret = float(np.mean(strategy_returns))
     std_ret = float(np.std(strategy_returns))
-    sharpe = (mean_ret / (std_ret + 1e-9)) * np.sqrt(8760)
+    sharpe = (mean_ret / (std_ret + 1e-9)) * np.sqrt(periods_per_year)
 
     # Win Rate and Profit Factor
     active_mask = (signals > 0)
@@ -179,7 +212,8 @@ def walk_forward_validation(
     X_dev: pd.DataFrame,
     y_dev: pd.Series,
     ret_dev: pd.Series,
-    n_splits: int = 3
+    n_splits: int = 3,
+    prediction_horizon: int = DEFAULT_PREDICTION_HORIZON
 ) -> pd.DataFrame:
     """
     Perform expanding-window walk-forward validation across the development period (Train + Val).
@@ -213,7 +247,7 @@ def walk_forward_validation(
         gb.fit(X_tr_s, y_tr)
         gb_pred = gb.predict(X_v_s)
         gb_acc = float(np.mean(gb_pred == y_v.values))
-        gb_bt = realistic_backtest(ret_v, gb_pred)
+        gb_bt = realistic_backtest(ret_v, gb_pred, stride=max(1, prediction_horizon))
 
         fold_results.append({
             "Fold": fold,
@@ -287,7 +321,8 @@ def train_and_evaluate_pipeline(
     coverage_df = diagnose_feature_coverage(dataset)
 
     # 3. Chronological Split (70% Train, 15% Val, 15% Untouched Test)
-    split = chronological_split(X, y, ret, train_ratio=0.70, val_ratio=0.15)
+    split = chronological_split(X, y, ret, train_ratio=0.70, val_ratio=0.15,
+                                embargo_hours=max(0, prediction_horizon))
 
     n_train = len(split["X_train"])
     n_val = len(split["X_val"])
@@ -339,14 +374,14 @@ def train_and_evaluate_pipeline(
     y_val_majority = np.full(n_val, majority_class)
     val_model_reports["Majority_Baseline"] = {
         **compute_metrics(split["y_val"].values, y_val_majority, np.full(n_val, 0.5)),
-        **realistic_backtest(split["ret_val"], y_val_majority, taker_fee, slippage)
+        **realistic_backtest(split["ret_val"], y_val_majority, taker_fee, slippage, stride=max(1, prediction_horizon))
     }
 
     momentum_col = "btc_return_1h" if "btc_return_1h" in split["X_val"].columns else feature_cols[0]
     y_val_momentum = (split["X_val"][momentum_col].values > 0).astype(int)
     val_model_reports["Momentum_Baseline"] = {
         **compute_metrics(split["y_val"].values, y_val_momentum, np.full(n_val, 0.5)),
-        **realistic_backtest(split["ret_val"], y_val_momentum, taker_fee, slippage)
+        **realistic_backtest(split["ret_val"], y_val_momentum, taker_fee, slippage, stride=max(1, prediction_horizon))
     }
 
     for model_name, configs in candidate_configs.items():
@@ -362,7 +397,7 @@ def train_and_evaluate_pipeline(
             for thresh in [0.45, 0.50, 0.55]:
                 val_preds = (val_probs >= thresh).astype(int)
                 val_m = compute_metrics(split["y_val"].values, val_preds, val_probs)
-                val_bt = realistic_backtest(split["ret_val"], val_preds, taker_fee, slippage)
+                val_bt = realistic_backtest(split["ret_val"], val_preds, taker_fee, slippage, stride=max(1, prediction_horizon))
 
                 val_score = val_m["Balanced_Accuracy"] + 0.1 * np.clip(val_bt["Sharpe_Ratio"], -2.0, 5.0)
 
@@ -394,7 +429,7 @@ def train_and_evaluate_pipeline(
     for thresh in [0.46, 0.48, 0.50, 0.52, 0.54]:
         ens_preds = (val_ensemble_probs >= thresh).astype(int)
         v_m = compute_metrics(split["y_val"].values, ens_preds, val_ensemble_probs)
-        v_bt = realistic_backtest(split["ret_val"], ens_preds, taker_fee, slippage)
+        v_bt = realistic_backtest(split["ret_val"], ens_preds, taker_fee, slippage, stride=max(1, prediction_horizon))
         v_sc = v_m["Balanced_Accuracy"] + 0.1 * np.clip(v_bt["Sharpe_Ratio"], -2.0, 5.0)
         if v_sc > best_ens_score:
             best_ens_score = v_sc
@@ -410,13 +445,13 @@ def train_and_evaluate_pipeline(
     y_test_majority = np.full(n_test, majority_class)
     test_model_reports["Majority_Baseline"] = {
         **compute_metrics(split["y_test"].values, y_test_majority, np.full(n_test, 0.5)),
-        **realistic_backtest(split["ret_test"], y_test_majority, taker_fee, slippage)
+        **realistic_backtest(split["ret_test"], y_test_majority, taker_fee, slippage, stride=max(1, prediction_horizon))
     }
 
     y_test_momentum = (split["X_test"][momentum_col].values > 0).astype(int)
     test_model_reports["Momentum_Baseline"] = {
         **compute_metrics(split["y_test"].values, y_test_momentum, np.full(n_test, 0.5)),
-        **realistic_backtest(split["ret_test"], y_test_momentum, taker_fee, slippage)
+        **realistic_backtest(split["ret_test"], y_test_momentum, taker_fee, slippage, stride=max(1, prediction_horizon))
     }
 
     for model_name, (trained_model, chosen_thresh) in best_models.items():
@@ -424,7 +459,7 @@ def train_and_evaluate_pipeline(
         test_preds = (test_probs >= chosen_thresh).astype(int)
 
         t_metrics = compute_metrics(split["y_test"].values, test_preds, test_probs)
-        t_backtest = realistic_backtest(split["ret_test"], test_preds, taker_fee, slippage)
+        t_backtest = realistic_backtest(split["ret_test"], test_preds, taker_fee, slippage, stride=max(1, prediction_horizon))
 
         test_model_reports[model_name] = {
             **t_metrics,
@@ -437,15 +472,17 @@ def train_and_evaluate_pipeline(
     high_conf_mask = (test_ens_probs >= 0.53) | (test_ens_probs <= 0.47)
     if np.sum(high_conf_mask) > 10:
         conf_preds = (test_ens_probs[high_conf_mask] >= 0.50).astype(int)
-        conf_acc = float(np.mean(conf_preds == split["y_test"].values[high_conf_mask]))
-        conf_bt = realistic_backtest(split["ret_test"].iloc[high_conf_mask], conf_preds, taker_fee, slippage)
+        conf_y = split["y_test"].values[high_conf_mask]
+        conf_probs = test_ens_probs[high_conf_mask]
+        conf_metrics = compute_metrics(conf_y, conf_preds, conf_probs)
+        conf_bt = realistic_backtest(split["ret_test"].iloc[high_conf_mask], conf_preds, taker_fee, slippage, stride=max(1, prediction_horizon))
         test_model_reports["Ensemble_High_Confidence"] = {
-            "Accuracy": round(conf_acc, 4),
-            "Balanced_Accuracy": round(conf_acc, 4),
-            "Precision": round(float(np.mean(split['y_test'].values[high_conf_mask][conf_preds == 1])), 4) if np.sum(conf_preds == 1) > 0 else 0.0,
-            "Recall": 0.0,
-            "F1_Score": 0.0,
-            "ROC_AUC": round(float(compute_metrics(split['y_test'].values[high_conf_mask], conf_preds, test_ens_probs[high_conf_mask])['ROC_AUC']), 4),
+            "Accuracy": round(conf_metrics["Accuracy"], 4),
+            "Balanced_Accuracy": round(conf_metrics["Balanced_Accuracy"], 4),
+            "Precision": round(conf_metrics["Precision"], 4),
+            "Recall": round(conf_metrics["Recall"], 4),
+            "F1_Score": round(conf_metrics["F1_Score"], 4),
+            "ROC_AUC": round(conf_metrics["ROC_AUC"], 4),
             **conf_bt,
             "Used_Threshold": "P>=0.53 or P<=0.47",
             "Confusion_Matrix": f"Active_Samples={np.sum(high_conf_mask)}/{n_test} ({np.sum(high_conf_mask)/n_test*100:.1f}%)"
@@ -465,30 +502,23 @@ def train_and_evaluate_pipeline(
         X_dev = pd.concat([split["X_train"], split["X_val"]])
         y_dev = pd.concat([split["y_train"], split["y_val"]])
         ret_dev = pd.concat([split["ret_train"], split["ret_val"]])
-        wf_df = walk_forward_validation(X_dev, y_dev, ret_dev, n_splits=3)
+        wf_df = walk_forward_validation(X_dev, y_dev, ret_dev, n_splits=3,
+                                        prediction_horizon=prediction_horizon)
 
     # 10. Save Best Trained Ensemble Artifact for Live Predictions
-    full_scaler = StandardScaler()
-    X_full_scaled = full_scaler.fit_transform(X)
-    gb_model.fit(X_full_scaled, y)
-    rf_model.fit(X_full_scaled, y)
-    lr_model.fit(X_full_scaled, y)
-
-    full_ensemble = SoftVotingEnsemble([
-        ("Gradient_Boosting", gb_model, 0.50),
-        ("Random_Forest", rf_model, 0.35),
-        ("Logistic_Regression", lr_model, 0.15)
-    ])
-
+    # Serialize the TRAIN-fitted scaler and ensemble that produced
+    # `best_ens_thresh`. Refitting on all data here would move live
+    # probabilities into a different feature space than the tuned threshold.
     artifact = {
-        "scaler": full_scaler,
-        "ensemble": full_ensemble,
+        "scaler": scaler,
+        "ensemble": ensemble,
         "feature_cols": feature_cols,
         "threshold": best_ens_thresh,
         "prediction_horizon": prediction_horizon,
-        "date_trained": str(dataset.index.max())
+        "date_trained": str(dataset.index.max()),
+        "trained_at": time.time()
     }
-    joblib.dump(artifact, MODEL_ARTIFACT_PATH)
+    atomic_joblib_dump(artifact, MODEL_ARTIFACT_PATH)
     print(f"[+] Serialized production ensemble model artifact to {MODEL_ARTIFACT_PATH}")
 
     return {
@@ -554,17 +584,35 @@ def train_x_period_pipeline(
     n_train = int(n * 0.70)
     n_val = int(n * 0.85)
 
-    X_train = X.iloc[:n_train]
-    y_train = y.iloc[:n_train]
-    ret_train = ret.iloc[:n_train]
+    # Labels span half a period; embargo the tail of train and val so they
+    # cannot leak into the following partition.
+    step_hours_meta = max(1, int(metadata['step_hours']))
+    embargo_rows = int(np.ceil(float(metadata['half_period_hours']) / step_hours_meta))
+    train_embargo = min(embargo_rows, n_train)
+    val_embargo = min(max(0, embargo_rows), n_val - n_train)
+    if embargo_rows > 0:
+        print(f"[*] Label embargo: dropping {train_embargo} train and {val_embargo} validation period rows "
+              f"({embargo_rows} stepping intervals).")
 
-    X_val = X.iloc[n_train:n_val]
-    y_val = y.iloc[n_train:n_val]
-    ret_val = ret.iloc[n_train:n_val]
+    train_end = n_train - train_embargo
+    val_end = n_val - val_embargo
+
+    X_train = X.iloc[:train_end]
+    y_train = y.iloc[:train_end]
+    ret_train = ret.iloc[:train_end]
+
+    X_val = X.iloc[n_train:val_end]
+    y_val = y.iloc[n_train:val_end]
+    ret_val = ret.iloc[n_train:val_end]
 
     X_test = X.iloc[n_val:]
     y_test = y.iloc[n_val:]
     ret_test = ret.iloc[n_val:]
+
+    # Non-overlapping trades: one position per full half-period horizon.
+    bt_stride = max(1, embargo_rows)
+    hours_per_trade = float(metadata['half_period_hours'])
+    bt_periods_per_year = 365.25 * 24.0 / hours_per_trade if hours_per_trade > 0 else 8760.0
 
     print(f"[*] Partitions: Train={len(X_train)} ({y_train.mean()*100:.1f}% Up) | Val={len(X_val)} ({y_val.mean()*100:.1f}% Up) | Test={len(X_test)} ({y_test.mean()*100:.1f}% Up)")
 
@@ -647,7 +695,8 @@ def train_x_period_pipeline(
         test_p = model.predict_proba(X_test_s)[:, 1]
         test_pred = (test_p >= best_th).astype(int)
         m = compute_metrics(y_test.values, test_pred, test_p)
-        bt = realistic_backtest(ret_test, test_pred, taker_fee=taker_fee, slippage=slippage)
+        bt = realistic_backtest(ret_test, test_pred, taker_fee=taker_fee, slippage=slippage,
+                                stride=bt_stride, periods_per_year=bt_periods_per_year)
         m.update(bt)
         test_reports[name] = m
 
@@ -655,7 +704,8 @@ def train_x_period_pipeline(
     test_probs = ensemble.predict_proba(X_test_s)[:, 1]
     test_preds = (test_probs >= best_th).astype(int)
     ens_metrics = compute_metrics(y_test.values, test_preds, test_probs)
-    ens_bt = realistic_backtest(ret_test, test_preds, taker_fee=taker_fee, slippage=slippage)
+    ens_bt = realistic_backtest(ret_test, test_preds, taker_fee=taker_fee, slippage=slippage,
+                                stride=bt_stride, periods_per_year=bt_periods_per_year)
     ens_metrics.update(ens_bt)
     test_reports["Ensemble_Model"] = ens_metrics
 
@@ -663,7 +713,8 @@ def train_x_period_pipeline(
     maj_val = int(y_train.mode()[0])
     maj_preds = np.full(len(y_test), maj_val)
     maj_metrics = compute_metrics(y_test.values, maj_preds, np.full(len(y_test), float(maj_val)))
-    maj_bt = realistic_backtest(ret_test, maj_preds, taker_fee=taker_fee, slippage=slippage)
+    maj_bt = realistic_backtest(ret_test, maj_preds, taker_fee=taker_fee, slippage=slippage,
+                                stride=bt_stride, periods_per_year=bt_periods_per_year)
     maj_metrics.update(maj_bt)
     test_reports["Majority_Baseline"] = maj_metrics
 
@@ -690,27 +741,13 @@ def train_x_period_pipeline(
         "Type": ["News" if "news" in c or "tone" in c else "Market" for c in feature_cols]
     }).sort_values(by="RF_Importance", ascending=False)
 
-    # Re-fit final model on full dataset for live production inference
-    full_scaler = RobustScaler()
-    X_full_s = full_scaler.fit_transform(X)
-    hgb.fit(X_full_s, y)
-    rf.fit(X_full_s, y)
-    et.fit(X_full_s, y)
-    lr.fit(X_full_s, y)
-    reg.fit(X_full_s, ret)
-
-    full_ensemble = SoftVotingEnsemble([
-        ("Hist_Gradient_Boosting", hgb, 0.35),
-        ("Random_Forest", rf, 0.35),
-        ("Extra_Trees", et, 0.20),
-        ("Logistic_Regression", lr, 0.10)
-    ])
-
+    # Serialize the TRAIN-fitted scaler and models used for honest OOS evaluation
+    # (threshold was tuned on X_val_s with this same scaler).
     artifact_path = get_x_period_artifact_path(x_days)
     artifact = {
         "x_days": x_days,
-        "scaler": full_scaler,
-        "ensemble": full_ensemble,
+        "scaler": scaler,
+        "ensemble": ensemble,
         "regressor": reg,
         "feature_cols": feature_cols,
         "optimal_threshold": best_th,
@@ -718,9 +755,12 @@ def train_x_period_pipeline(
         "high_conv_acc": high_conv_acc,
         "high_conv_count": high_conv_count,
         "total_test_samples": len(y_test),
-        "date_trained": str(dataset.index.max())
+        "prediction_horizon": metadata['half_period_hours'],
+        "step_hours": metadata['step_hours'],
+        "date_trained": str(dataset.index.max()),
+        "trained_at": time.time()
     }
-    joblib.dump(artifact, artifact_path)
+    atomic_joblib_dump(artifact, artifact_path)
     print(f"[+] Serialized X-day model artifact ({x_days} days) to {artifact_path}")
 
     return {
@@ -732,4 +772,59 @@ def train_x_period_pipeline(
         "high_conv_count": high_conv_count,
         "artifact_path": str(artifact_path)
     }
+
+
+def train_all_periods(
+    periods: Optional[Dict[str, float]] = None,
+    taker_fee: float = DEFAULT_TAKER_FEE,
+    slippage: float = DEFAULT_SLIPPAGE,
+    db_path: Optional[str] = None
+) -> Dict[str, Dict[str, Any]]:
+    """Train one independent model for every live trading period.
+
+    All models are built from the same growing historical database (BTC candles
+    + GDELT news), but each uses its own horizon so its artifact/threshold
+    match the period it serves. Failures for one period do not block the rest.
+    """
+    schedule = dict(periods or LIVE_PERIOD_X_DAYS)
+    results: Dict[str, Dict[str, Any]] = {}
+
+    print("\n" + "=" * 86)
+    print("  TRAINING ALL LIVE PERIOD MODELS FROM FULL HISTORICAL DATABASE")
+    print("=" * 86)
+    for period_id, x_days in schedule.items():
+        print(f"\n[*] {period_id.upper()} -> X = {x_days:g} days")
+        try:
+            result = train_x_period_pipeline(
+                x_days=x_days,
+                taker_fee=taker_fee,
+                slippage=slippage,
+                db_path=db_path
+            )
+            meta = result.get("metadata", {})
+            results[period_id] = {
+                "x_days": x_days,
+                "samples": meta.get("total_samples", 0),
+                "date_start": meta.get("date_start"),
+                "date_end": meta.get("date_end"),
+                "threshold": result.get("optimal_threshold"),
+                "artifact_path": str(result.get("artifact_path")),
+            }
+            print(f"[+] {period_id.upper()} model updated "
+                  f"({results[period_id]['samples']} samples, "
+                  f"threshold={results[period_id]['threshold']}).")
+        except Exception as exc:
+            results[period_id] = {"error": str(exc)}
+            print(f"[!] {period_id.upper()} training failed: {exc}")
+
+    print("\n" + "=" * 86)
+    print("  PERIOD MODEL UPDATE SUMMARY")
+    print("=" * 86)
+    for period_id, res in results.items():
+        if "error" in res:
+            print(f"  {period_id.upper():<6} FAILED: {res['error']}")
+        else:
+            print(f"  {period_id.upper():<6} {res['x_days']:g}d  "
+                  f"samples={res['samples']}  threshold={res['threshold']}")
+    return results
 

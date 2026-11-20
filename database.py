@@ -1,6 +1,7 @@
 """Database layer using SQLite for GDELT news and Bitcoin market data."""
 
 import sqlite3
+from contextlib import closing
 import pandas as pd
 from typing import List, Dict, Any, Optional
 from config import DB_PATH
@@ -17,7 +18,7 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
 
 def init_db(db_path: Optional[str] = None):
     """Initialize database tables and indexes."""
-    with get_connection(db_path) as conn:
+    with closing(get_connection(db_path)) as conn:
         cursor = conn.cursor()
 
         # News Articles Table
@@ -63,6 +64,16 @@ def init_db(db_path: Optional[str] = None):
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_btc_timestamp ON btc_prices(timestamp);")
 
+        # Track completed historical backfill files so a resume skips them.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ingestion_progress (
+                source_key TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL DEFAULT 'gkg',
+                inserted_count INTEGER DEFAULT 0,
+                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         conn.commit()
 
 
@@ -84,7 +95,7 @@ def insert_news_batch(articles: List[Dict[str, Any]], db_path: Optional[str] = N
             :organizations
         );
     """
-    with get_connection(db_path) as conn:
+    with closing(get_connection(db_path)) as conn:
         cursor = conn.cursor()
         cursor.executemany(query, articles)
         conn.commit()
@@ -103,7 +114,7 @@ def insert_btc_prices(prices: List[Dict[str, Any]], db_path: Optional[str] = Non
             :timestamp, :open, :high, :low, :close, :volume, :quote_volume, :trades_count
         );
     """
-    with get_connection(db_path) as conn:
+    with closing(get_connection(db_path)) as conn:
         cursor = conn.cursor()
         cursor.executemany(query, prices)
         conn.commit()
@@ -112,7 +123,7 @@ def insert_btc_prices(prices: List[Dict[str, Any]], db_path: Optional[str] = Non
 
 def get_database_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
     """Retrieve statistical summary of stored data."""
-    with get_connection(db_path) as conn:
+    with closing(get_connection(db_path)) as conn:
         cursor = conn.cursor()
 
         # Count news
@@ -143,3 +154,28 @@ def get_database_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
         "btc_price_count": btc_count,
         "btc_date_range": (btc_min, btc_max)
     }
+
+
+def is_source_processed(source_key: str, db_path: Optional[str] = None) -> bool:
+    """Return True when a historical source file has already been ingested."""
+    with closing(get_connection(db_path)) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM ingestion_progress WHERE source_key = ?", (source_key,)
+        ).fetchone()
+        return row is not None
+
+
+def mark_source_processed(
+    source_key: str,
+    inserted_count: int = 0,
+    source_type: str = "gkg",
+    db_path: Optional[str] = None
+) -> None:
+    """Record a completed historical source file for resumable backfill."""
+    with closing(get_connection(db_path)) as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO ingestion_progress
+                (source_key, source_type, inserted_count, processed_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        """, (source_key, source_type, int(inserted_count)))
+        conn.commit()

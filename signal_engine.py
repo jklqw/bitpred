@@ -64,7 +64,7 @@ def fetch_latest_market_candles(limit: int = 150) -> pd.DataFrame:
     return df
 
 
-def generate_live_signal(prediction_horizon: int = 4) -> Dict[str, Any]:
+def generate_live_signal(prediction_horizon: int = DEFAULT_PREDICTION_HORIZON) -> Dict[str, Any]:
     """
     Run end-to-end real-time inference:
     1. Fetch live candles & news data
@@ -90,15 +90,23 @@ def generate_live_signal(prediction_horizon: int = 4) -> Dict[str, Any]:
     else:
         merged = market_features
 
-    # 4. Load trained model artifact (or train if missing)
+    # 4. Load trained model artifact (or train if missing / horizon mismatch)
     if not os.path.exists(MODEL_ARTIFACT_PATH):
         print("[*] Model artifact not found. Training production ensemble model now...")
         train_and_evaluate_pipeline(prediction_horizon=prediction_horizon)
 
     artifact = joblib.load(MODEL_ARTIFACT_PATH)
+    artifact_horizon = artifact.get("prediction_horizon")
+    if artifact_horizon is not None and int(artifact_horizon) != int(prediction_horizon):
+        print(f"[!] Warning: model artifact was trained for {artifact_horizon}h, but {prediction_horizon}h "
+              f"was requested. Retraining for {prediction_horizon}h...")
+        train_and_evaluate_pipeline(prediction_horizon=prediction_horizon)
+        artifact = joblib.load(MODEL_ARTIFACT_PATH)
+
     scaler = artifact["scaler"]
     ensemble = artifact["ensemble"]
     feature_cols = artifact["feature_cols"]
+    threshold = float(artifact.get("threshold", 0.5))
 
     # 5. Extract latest feature row (from last closed candle to avoid unfinished bar noise)
     target_row = merged.iloc[[-2]].copy()
@@ -114,23 +122,28 @@ def generate_live_signal(prediction_horizon: int = 4) -> Dict[str, Any]:
     prob_up = float(ensemble.predict_proba(X_latest_scaled)[0, 1])
     prob_down = 1.0 - prob_up
 
-    # 7. Formulate Decision & Confidence
-    if prob_up >= 0.58:
+    # 7. Formulate Decision & Confidence (cutoffs centred on the tuned threshold)
+    strong_buy_th = threshold + 0.08
+    buy_th = threshold + 0.03
+    sell_th = threshold - 0.03
+    strong_sell_th = threshold - 0.08
+
+    if prob_up >= strong_buy_th:
         action = "STRONG BUY / LONG"
         color = "🟢"
         bias = "Bullish"
         confidence = "High"
-    elif prob_up >= 0.53:
+    elif prob_up >= buy_th:
         action = "BUY / ACCUMULATE"
         color = "🟢"
         bias = "Moderately Bullish"
         confidence = "Moderate"
-    elif prob_up <= 0.42:
+    elif prob_up <= strong_sell_th:
         action = "STRONG SELL / SHORT"
         color = "🔴"
         bias = "Bearish"
         confidence = "High"
-    elif prob_up <= 0.47:
+    elif prob_up <= sell_th:
         action = "SELL / CASH / REDUCE"
         color = "🔴"
         bias = "Moderately Bearish"
@@ -254,7 +267,8 @@ def print_signal_dashboard(signal_data: Dict[str, Any]):
 
 def generate_x_period_action(
     x_days: float = 4.0,
-    db_path: Optional[str] = None
+    db_path: Optional[str] = None,
+    live_candle: bool = False
 ) -> Dict[str, Any]:
     """
     Real-time inference for X-day period prediction:
@@ -265,10 +279,11 @@ def generate_x_period_action(
     5. Returns actionable decision: BUY / LONG or SELL / SHORT at this time.
     """
     H_total = int(round(x_days * 24))
-    H_half = int(round(x_days * 12))
+    H_half = H_total / 2.0
+    H_half_idx = int(round(H_half))  # integer candle offset for feature windows
     W_offset = 168  # 7 days in hours
 
-    candles_needed = min(1000, max(500, W_offset + H_half + 250))
+    candles_needed = min(1000, max(500, W_offset + H_half_idx + 250))
     raw = fetch_binance_btc_klines_chunk(interval="1h", limit=candles_needed)
     if not raw:
         raise RuntimeError("Failed to retrieve live market data from Binance API.")
@@ -335,13 +350,14 @@ def generate_x_period_action(
         news_hourly = pd.DataFrame()
 
     # Align decision time: last completed 1h candle to avoid incomplete candle noise
-    idx_mid = len(df_live) - 2
+    # live_candle=True evaluates on the still-forming candle so probabilities move with price
+    idx_mid = len(df_live) - (1 if live_candle else 2)
     t_curr_mid = df_live.index[idx_mid]
     current_live_price = float(df_live['close'].iloc[-1])
 
-    t_start = t_curr_mid - pd.Timedelta(hours=H_half)
+    t_start = t_curr_mid - pd.Timedelta(hours=H_half_idx)
     t_prev_start = t_start - pd.Timedelta(hours=W_offset)
-    t_prev_end = t_prev_start + pd.Timedelta(hours=H_half)
+    t_prev_end = t_prev_start + pd.Timedelta(hours=H_half_idx)
 
     # Resolve nearest indices
     idx_start = df_live.index.get_indexer([t_start], method="nearest")[0]
@@ -358,10 +374,12 @@ def generate_x_period_action(
         include_targets=False
     )
 
-    # Load or train production model artifact
+    # Load production model artifact. Retraining is intentionally NOT done here:
+    # signal evaluation must stay fast. Freshness is handled by the scheduled
+    # background retrain (web_server) and the explicit `--train-all-periods` CLI.
     artifact_path = get_x_period_artifact_path(x_days)
     if not os.path.exists(artifact_path):
-        print(f"[*] Model artifact for X={x_days} days not found. Training model now...")
+        print(f"[*] Model artifact for X={x_days:g} days not found. Training model now...")
         train_x_period_pipeline(x_days=x_days, db_path=db_path)
 
     artifact = joblib.load(artifact_path)
@@ -369,7 +387,7 @@ def generate_x_period_action(
     ensemble = artifact["ensemble"]
     regressor = artifact["regressor"]
     feature_cols = artifact["feature_cols"]
-    threshold = artifact.get("optimal_threshold", 0.50)
+    threshold = float(artifact.get("optimal_threshold", 0.50))
 
     # Vectorize and scale
     X_live = pd.DataFrame([feature_dict])[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -389,31 +407,35 @@ def generate_x_period_action(
     interim_delta_dollars = current_live_price - p_start
     interim_delta_pct = (interim_delta_dollars / p_start) * 100.0
 
-    # Decision Formulation: Direction is dictated by dominant calibrated ensemble probability
-    if prob_up >= 0.50:
+    # Decision Formulation: classifier uses the tuned threshold symmetrically;
+    # a regressor sign conflict leaves no actionable trade (target stays raw).
+    buy_signal = prob_up >= threshold
+    conflict = (buy_signal and pred_delta_pct < 0.0) or ((not buy_signal) and pred_delta_pct > 0.0)
+
+    if conflict:
+        action = "WAIT / CONFLICT"
+        action_icon = "⚪"
+        bias = "Conflicting Signals"
+        confidence = "Signal Conflict"
+    elif buy_signal:
         action = "BUY / LONG"
         action_icon = "🟢"
         bias = "Bullish Target Expected"
         confidence = "High Conviction" if prob_up >= max(0.55, threshold) else "Moderate Conviction"
-        if expected_target_price <= current_live_price:
-            expected_target_price = current_live_price + abs(pred_delta_dollars if abs(pred_delta_dollars) > 100 else current_live_price * 0.015)
-        remaining_delta_dollars = expected_target_price - current_live_price
-        remaining_delta_pct = (remaining_delta_dollars / current_live_price) * 100.0
     else:
         action = "SELL / SHORT"
         action_icon = "🔴"
         bias = "Bearish Target Expected"
-        confidence = "High Conviction" if prob_down >= 0.55 else "Moderate Conviction"
-        if expected_target_price >= current_live_price:
-            expected_target_price = current_live_price - abs(pred_delta_dollars if abs(pred_delta_dollars) > 100 else current_live_price * 0.015)
-        remaining_delta_dollars = expected_target_price - current_live_price
-        remaining_delta_pct = (remaining_delta_dollars / current_live_price) * 100.0
+        confidence = "High Conviction" if prob_down >= max(0.55, 1.0 - threshold) else "Moderate Conviction"
 
     # Risk Management Levels
     natr = feature_dict.get('natr_14', 1.5)
     atr_dollars = current_live_price * (natr / 100.0)
 
-    if "BUY" in action:
+    if conflict:
+        stop_loss = current_live_price - (1.5 * atr_dollars)
+        take_profit = current_live_price + (2.0 * atr_dollars)
+    elif "BUY" in action:
         stop_loss = current_live_price - (1.5 * atr_dollars)
         take_profit = expected_target_price if expected_target_price > current_live_price else current_live_price + (2.0 * atr_dollars)
     else:
@@ -422,8 +444,14 @@ def generate_x_period_action(
 
     target_time_utc = t_curr_mid + pd.Timedelta(hours=H_half)
 
+    sigma_1h = float(df_live['ret_1h'].tail(72).std())
+    if not np.isfinite(sigma_1h) or sigma_1h <= 0.0:
+        sigma_1h = 0.005
+
     return {
         "x_days": x_days,
+        "horizon_hours": H_half,
+        "sigma_1h": sigma_1h,
         "half_days": x_days / 2.0,
         "current_time_utc": str(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
         "period_start_time": str(df_live.index[idx_start].strftime("%Y-%m-%d %H:%M:%S UTC")),
@@ -437,6 +465,7 @@ def generate_x_period_action(
         "action_icon": action_icon,
         "bias": bias,
         "confidence": confidence,
+        "decision_threshold": round(threshold, 4),
         "prob_up": round(prob_up * 100.0, 1),
         "prob_down": round(prob_down * 100.0, 1),
         "pred_total_delta_pct": round(pred_delta_pct * 100.0, 2),

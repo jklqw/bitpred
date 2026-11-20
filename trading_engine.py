@@ -21,7 +21,10 @@ if str(BASE_DIR) not in sys.path:
 
 import numpy as np
 import pandas as pd
-from config import DATA_DIR, USER_AGENT
+from config import (
+    DATA_DIR, USER_AGENT, MIN_ENTRY_HIT_PROB, EXIT_HIT_PROB,
+    MODEL_RETRAIN_INTERVAL_HOURS
+)
 from signal_engine import generate_x_period_action
 from database import get_connection, insert_btc_prices, insert_news_batch
 from btc_fetcher import fetch_binance_btc_klines_chunk
@@ -29,6 +32,9 @@ from gdelt_fetcher import get_recent_gkg_urls, fetch_and_process_gkg_zip
 
 STATE_FILE = DATA_DIR / "live_trading_state.json"
 _last_sync_timestamp = 0.0
+
+# Suppress repeated alerts with the same signature (period/type/direction pair)
+ALERT_COOLDOWN_SECONDS = 600.0
 
 
 def sync_latest_market_and_news_data(db_path: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
@@ -179,6 +185,64 @@ def fetch_live_btc_price_fast() -> float:
     return _last_valid_live_btc_price
 
 
+def _parse_state_datetime(value: Any) -> Optional[datetime]:
+    """Load an ISO timestamp from persisted state without failing on legacy/null values."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _norm_ppf(p: float) -> float:
+    """Inverse normal CDF via bisection (no scipy dependency)."""
+    p = min(max(p, 1e-4), 1.0 - 1e-4)
+    lo, hi = -8.0, 8.0
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        if _norm_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def period_model_signal(period_hours: float) -> Dict[str, Any]:
+    """
+    Model signal whose forecast horizon equals the trade period.
+    The X-day model predicts X/2 ahead of decision time, so a period of P hours
+    uses the model with x_days = 2*P/24 (e.g. 3h trade -> 6h model, 1d -> 2d model).
+    """
+    return generate_x_period_action(x_days=2.0 * period_hours / 24.0, live_candle=True)
+
+
+def trade_end_hit_prob(model_result: Dict[str, Any], direction: str, entry_price: float,
+                       live_price: float, hours_left: float, period_hours: float) -> Dict[str, float]:
+    """
+    Probability that price at the trade's own end_time is on the winning side of entry.
+    Model gives p_up for the full period; its implied standardized drift z is scaled to the
+    remaining time, and the move already made (live vs entry) is added:
+        P(up at end) = Phi( ln(live/entry)/(sigma_1h*sqrt(R)) + z*sqrt(R/L) )
+    As R -> 0 this converges to 1 or 0 depending on where price sits vs entry.
+    """
+    R = max(hours_left, 1.0 / 60.0)
+    L = max(period_hours, 1e-6)
+    sigma = max(float(model_result.get("sigma_1h") or 0.0), 1e-4)
+    z = _norm_ppf(float(model_result.get("prob_up", 50.0)) / 100.0)
+    d = math.log(live_price / entry_price)
+    p_up = _norm_cdf(d / (sigma * math.sqrt(R)) + z * math.sqrt(min(R, L) / L))
+    p_up *= 100.0
+    return {"prob_up": round(p_up, 1), "prob_down": round(100.0 - p_up, 1)}
+
+
 class PeriodStrategyTracker:
     """
     Manages live automated 4x leveraged execution for one specific time period.
@@ -205,6 +269,10 @@ class PeriodStrategyTracker:
         self.last_signal_direction: Optional[str] = None
         self.last_signal_hit_prob: Optional[float] = None
         self.active_alert: Optional[Dict[str, Any]] = None
+        self.last_alert_signature: Optional[tuple] = None
+        self.last_alert_time: Optional[datetime] = None
+        self.recent_alert_times: Dict[tuple, datetime] = {}
+        self.reentry_blocked_until: Optional[datetime] = None
 
         self.live_hit_prob: Optional[float] = None
         self.live_prob_up: Optional[float] = None
@@ -214,83 +282,109 @@ class PeriodStrategyTracker:
 
         self.is_liquidated = False
 
-    def evaluate_alert(self, new_direction: str, new_hit_prob: float, live_price: float, current_time: datetime) -> Optional[Dict[str, Any]]:
+    def evaluate_alert(self, new_direction: str, new_hit_prob: float, live_price: float,
+                       current_time: datetime, live_hit_prob: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """
-        Check if direction changed with high hit probability ("Hit prob too much").
-        Alert triggers ONLY when:
-        1. Direction changed relative to the active position (or last signal):
-           - AND the new direction has high hit probability (new_hit_prob >= 60.0%).
-             (If new_hit_prob < 60%, it is low conviction / chop and does NOT alert).
-           - Severity: CRITICAL if new_hit_prob >= 65.0%, WARNING if 60.0% <= new_hit_prob < 65.0%.
-        2. Or in the same direction, hit probability shifts drastically by >= 25.0% AND new_hit_prob >= 60.0%.
+        Check whether the freshly evaluated signal changed direction or conviction.
+
+        Alerts fire ONLY when:
+        1. The direction flips relative to the LAST EVALUATED SIGNAL and the new
+           direction has high hit probability (>= 60%). Severity is CRITICAL at
+           >= 65%, otherwise WARNING.
+        2. Or the hit probability of the same direction shifts by >= 25% and the
+           new probability is >= 60%.
+
+        The baseline is `last_signal_*` (not the entry signal) so an unchanged
+        reversal cannot fire again on every 30-second evaluation. A short
+        cooldown also suppresses flapping between the same two states.
         """
-        # Determine baseline direction and probability from active trade or previous signal
-        if self.active_trade:
-            old_dir = self.active_trade["direction"]
-            old_prob = self.active_trade.get("hit_probability_pct", 50.0)
-        elif self.last_signal_direction is not None:
+        if self.last_signal_direction is not None:
             old_dir = self.last_signal_direction
             old_prob = self.last_signal_hit_prob if self.last_signal_hit_prob is not None else 50.0
+        elif self.active_trade:
+            old_dir = self.active_trade["direction"]
+            old_prob = self.active_trade.get("hit_probability_pct", 50.0)
         else:
             self.last_signal_direction = new_direction
             self.last_signal_hit_prob = new_hit_prob
             return None
 
-        prob_diff = new_hit_prob - old_prob
-        alert = None
+        reversed_dir = new_direction != old_dir
+        # For a reversal, compare conviction in the NEW direction rather than
+        # subtracting two hit probabilities that describe opposite outcomes.
+        prob_diff = (new_hit_prob - (100.0 - old_prob)) if reversed_dir else (new_hit_prob - old_prob)
+        prob_diff = round(max(-100.0, min(100.0, prob_diff)), 1)
 
-        if new_direction != old_dir:
-            # Direction flipped! Only alert if new direction has HIGH hit probability (>= 60%)
-            if new_hit_prob >= 60.0:
-                is_high_conviction = new_hit_prob >= 65.0
-                severity = "CRITICAL" if is_high_conviction else "WARNING"
-                alert = {
-                    "alert_id": f"alert-{self.period_id}-{int(current_time.timestamp())}",
-                    "timestamp": current_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                    "period_id": self.period_id,
-                    "period_name": self.name,
-                    "type": "DIRECTION_REVERSAL",
-                    "severity": severity,
-                    "dismissed": False,
-                    "old_direction": old_dir,
-                    "new_direction": new_direction,
-                    "old_hit_prob": round(old_prob, 1),
-                    "new_hit_prob": round(new_hit_prob, 1),
-                    "prob_change_pct": round(prob_diff, 1),
-                    "title": f"🚨 {self.name} Direction Reversal Alert!",
-                    "message": f"{self.name} active {old_dir} ({old_prob:.1f}%) flipped to high-conviction {new_direction} with {new_hit_prob:.1f}% hit prob! Significant directional reversal detected.",
-                    "price_at_alert": round(live_price, 2)
-                }
+        alert_type = None
+        severity = None
+        if reversed_dir and new_hit_prob >= 60.0:
+            alert_type = "DIRECTION_REVERSAL"
+            severity = "CRITICAL" if new_hit_prob >= 65.0 else "WARNING"
+        elif not reversed_dir and abs(prob_diff) >= 25.0 and new_hit_prob >= 60.0:
+            alert_type = "PROBABILITY_SHIFT"
+            severity = "WARNING"
+
+        signature = (self.period_id, alert_type, old_dir, new_direction) if alert_type else None
+        previous_time = self.recent_alert_times.get(signature) if signature else None
+        in_cooldown = (
+            previous_time is not None
+            and (current_time - previous_time).total_seconds() < ALERT_COOLDOWN_SECONDS
+        )
+
+        alert = None
+        if alert_type and not in_cooldown:
+            live_note = ""
+            if live_hit_prob is not None:
+                live_note = f" (live position win prob {live_hit_prob:.1f}%)"
+            if alert_type == "DIRECTION_REVERSAL":
+                title = f"🚨 {self.name} Direction Reversal Alert!"
+                message = (
+                    f"{self.name} signal flipped from {old_dir} ({old_prob:.1f}%) to high-conviction "
+                    f"{new_direction} ({new_hit_prob:.1f}%){live_note}. Significant directional reversal detected."
+                )
             else:
-                # Low conviction flip (<60%): do not alert, retain steady active position
-                pass
-        elif abs(prob_diff) >= 25.0 and new_hit_prob >= 60.0:
-            # Significant probability shift in same direction
+                title = f"⚠️ {self.name} Hit Prob Swing Alert!"
+                message = (
+                    f"{self.name} {new_direction} hit probability shifted by {prob_diff:+.1f}% "
+                    f"({old_prob:.1f}% → {new_hit_prob:.1f}%){live_note}."
+                )
             alert = {
-                "alert_id": f"alert-{self.period_id}-{int(current_time.timestamp())}",
+                "alert_id": f"alert-{self.period_id}-{int(current_time.timestamp() * 1000)}",
                 "timestamp": current_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "period_id": self.period_id,
                 "period_name": self.name,
-                "type": "PROBABILITY_SHIFT",
-                "severity": "WARNING",
+                "type": alert_type,
+                "severity": severity,
                 "dismissed": False,
                 "old_direction": old_dir,
                 "new_direction": new_direction,
                 "old_hit_prob": round(old_prob, 1),
                 "new_hit_prob": round(new_hit_prob, 1),
-                "prob_change_pct": round(prob_diff, 1),
-                "title": f"⚠️ {self.name} Hit Prob Swing Alert!",
-                "message": f"{self.name} {new_direction} hit probability shifted by {prob_diff:+.1f}% ({old_prob:.1f}% → {new_hit_prob:.1f}%).",
+                "prob_change_pct": prob_diff,
+                "live_hit_prob": round(live_hit_prob, 1) if live_hit_prob is not None else None,
+                "title": title,
+                "message": message,
                 "price_at_alert": round(live_price, 2)
             }
+            self.last_alert_signature = signature
+            self.last_alert_time = current_time
+            self.recent_alert_times[signature] = current_time
+            # Keep the cooldown map small; stale entries can never fire again.
+            if len(self.recent_alert_times) > 32:
+                cutoff = current_time - timedelta(seconds=ALERT_COOLDOWN_SECONDS)
+                self.recent_alert_times = {
+                    sig: when for sig, when in self.recent_alert_times.items() if when > cutoff
+                }
 
-        # Update tracked signal state
+        # Update tracked signal state AFTER the baseline has been used.
         self.last_signal_direction = new_direction
         self.last_signal_hit_prob = new_hit_prob
 
         if alert:
             self.active_alert = alert
             print(f"\n[ALERT] 🚨 {alert['message']}\n")
+        else:
+            self.active_alert = None
 
         return alert
 
@@ -411,6 +505,7 @@ class PeriodStrategyTracker:
             "live_prob_up": self.live_prob_up,
             "live_prob_down": self.live_prob_down,
             "active_alert": self.active_alert,
+            "reentry_blocked_until": self.reentry_blocked_until.isoformat() if self.reentry_blocked_until else None,
             "last_signal_direction": self.last_signal_direction,
             "last_signal_hit_prob": self.last_signal_hit_prob,
             "recent_trades": list(reversed(self.trade_history[-10:])),
@@ -426,7 +521,35 @@ class PeriodStrategyTracker:
         """
         if self.balance_usdt <= 1.0:
             self.is_liquidated = True
-            return
+            return False
+
+        # Do not re-enter immediately after an early probability-based exit.
+        if self.reentry_blocked_until is not None and current_time < self.reentry_blocked_until:
+            return False
+
+        # If model result not provided, synchronize fresh data & run inference
+        if model_result is None:
+            try:
+                sync_latest_market_and_news_data()
+                model_result = period_model_signal(self.hours)
+            except Exception as e:
+                print(f"[!] {self.period_id.upper()} inference failed, no trade opened: {e}")
+                return False
+
+        action_label = str(model_result.get("action", "BUY")).upper()
+        if "WAIT" in action_label:
+            return False
+
+        direction = "LONG" if "BUY" in action_label else "SHORT"
+        _pu = float(model_result.get("prob_up", 50.0))
+        _pd = float(model_result.get("prob_down", 50.0))
+        _hit = _pu if direction == "LONG" else _pd
+        self.live_prob_up, self.live_prob_down = round(_pu, 1), round(_pd, 1)
+        self.live_hit_prob = round(_hit, 1)
+
+        # Entry gate: only open when hit probability is above the threshold
+        if _hit <= MIN_ENTRY_HIT_PROB:
+            return False
 
         # Deduct upfront fee (0.1% or 0.3% for 3d)
         fee_usdt = self.balance_usdt * self.fee_rate
@@ -435,24 +558,6 @@ class PeriodStrategyTracker:
 
         margin_usdt = self.balance_usdt
         position_notional_usdt = margin_usdt * self.leverage
-
-        # If model result not provided, synchronize fresh data & run inference
-        if model_result is None:
-            try:
-                sync_latest_market_and_news_data()
-                model_result = generate_x_period_action(x_days=self.x_days)
-            except Exception as e:
-                # Safe fallback
-                model_result = {
-                    "action": "SELL / SHORT",
-                    "confidence": "Moderate Conviction",
-                    "prob_up": 35.0,
-                    "prob_down": 65.0,
-                    "pred_total_delta_dollars": -1200.0,
-                    "expected_target_price": live_price - 1200.0
-                }
-
-        direction = "LONG" if "BUY" in model_result.get("action", "BUY") else "SHORT"
 
         # Apply slippage: Buy price is 0.01% higher, Sell price is 0.01% lower
         if direction == "LONG":
@@ -509,8 +614,9 @@ class PeriodStrategyTracker:
             "live_hit_probability_pct": round(hit_prob, 1),
             "expected_delta_usd": model_result.get("pred_total_delta_dollars", 0.0)
         }
+        return True
 
-    def close_active_trade(self, live_price: float, current_time: datetime, reason: str = "PERIOD_EXPIRED"):
+    def close_active_trade(self, live_price: float, current_time: datetime, reason: str = "PERIOD_EXPIRED", exit_reason: Optional[str] = None):
         """
         Close active position at end of period (or liquidation).
         Applies closing slippage and books realized PnL in USDT.
@@ -561,6 +667,7 @@ class PeriodStrategyTracker:
             "pnl_pct": round(pnl_pct, 2),
             "fee_usdt": round(t["fee_usdt"], 2),
             "status": reason,
+            "exit_reason": exit_reason or reason,
             "balance_after_usdt": round(self.balance_usdt, 2),
             "confidence": t["confidence"],
             "hit_probability_pct": t.get("hit_probability_pct", 50.0)
@@ -574,6 +681,7 @@ class PeriodStrategyTracker:
         })
 
         self.active_trade = None
+        self.active_alert = None
 
     def update_tick(self, live_price: float, current_time: datetime):
         """
@@ -606,9 +714,7 @@ class PeriodStrategyTracker:
                 print(f"[*] {self.period_id.upper()} period completed ({self.hours}h). Closing trade and opening next period...")
                 self.close_active_trade(live_price, current_time, reason="CLOSED")
                 self.open_new_trade(live_price, current_time)
-        else:
-            # No trade open yet -> open first trade
-            self.open_new_trade(live_price, current_time)
+        # else: flat -> wait for update_live_signals to open when hit prob > MIN_ENTRY_HIT_PROB
 
 
 class MultiPeriodTradingManager:
@@ -670,7 +776,7 @@ class MultiPeriodTradingManager:
             if tr.is_liquidated:
                 continue
             try:
-                model_result = generate_x_period_action(x_days=tr.x_days)
+                model_result = period_model_signal(tr.hours)
                 prob_up = float(model_result.get("prob_up", 50.0))
                 prob_down = float(model_result.get("prob_down", 50.0))
                 tr.live_prob_up = round(prob_up, 1)
@@ -678,20 +784,42 @@ class MultiPeriodTradingManager:
                 tr.live_confidence = model_result.get("confidence", "Moderate Conviction")
                 tr.last_live_eval_time = current_time
 
+                action_label = str(model_result.get("action", "")).upper()
+                has_actionable_signal = "WAIT" not in action_label
                 dir_now = "LONG" if prob_up >= 50.0 else "SHORT"
                 hit_prob_now = prob_up if dir_now == "LONG" else prob_down
 
                 if tr.active_trade:
-                    dir_active = tr.active_trade["direction"]
-                    tr.live_hit_prob = round(prob_up if dir_active == "LONG" else prob_down, 1)
-                else:
+                    at = tr.active_trade
+                    dir_active = at["direction"]
+                    hrs_left = (datetime.fromisoformat(at["end_time"]) - current_time).total_seconds() / 3600.0
+                    anch = trade_end_hit_prob(model_result, dir_active, at["entry_price"], live_price, hrs_left, tr.hours)
+                    tr.live_prob_up, tr.live_prob_down = anch["prob_up"], anch["prob_down"]
+                    tr.live_hit_prob = anch["prob_up"] if dir_active == "LONG" else anch["prob_down"]
+                    # Exit gate: probability of finishing the period on the right side collapsed
+                    if tr.live_hit_prob < EXIT_HIT_PROB:
+                        print(f"[*] {pid.upper()} closing {dir_active}: end-of-period hit prob {tr.live_hit_prob:.1f}% < {EXIT_HIT_PROB}%")
+                        tr.close_active_trade(live_price, current_time, reason="CLOSED", exit_reason="PROB_EXIT")
+                        # Block an immediate re-entry at the same (bad) price with a new timer.
+                        tr.reentry_blocked_until = current_time + timedelta(minutes=max(15, tr.hours * 15))
+                if not tr.active_trade:
                     tr.live_hit_prob = round(hit_prob_now, 1)
+                    # Flat: open a trade only with an actionable, high-conviction signal
+                    if has_actionable_signal and hit_prob_now > MIN_ENTRY_HIT_PROB:
+                        if tr.open_new_trade(live_price, current_time, model_result):
+                            print(f"[+] {pid.upper()} opened {dir_now} at hit prob {hit_prob_now:.1f}% (> {MIN_ENTRY_HIT_PROB}%)")
+                            continue
 
-                alert = tr.evaluate_alert(dir_now, hit_prob_now, live_price, current_time)
-                if alert:
-                    self.record_alert(alert)
+                # Evaluate alerts only for actionable model signals. The live
+                # (anchored) win probability is attached for context so alert
+                # text cannot contradict the probability shown on the dashboard.
+                if has_actionable_signal:
+                    alert = tr.evaluate_alert(dir_now, hit_prob_now, live_price, current_time,
+                                              live_hit_prob=tr.live_hit_prob)
+                    if alert:
+                        self.record_alert(alert)
             except Exception as e:
-                pass
+                print(f"[!] {pid.upper()} live signal update failed: {e}")
 
     evaluate_live_alerts = update_live_signals
 
@@ -701,7 +829,7 @@ class MultiPeriodTradingManager:
         - Sets balance to 1,000 USDT
         - Completely clears any previous history (clean start from this exact moment)
         - Synchronizes latest market candles & GDELT news into SQLite
-        - Opens a brand new 4x leveraged trade starting at the exact current time
+        - Stays flat; a new trade opens only when hit prob > MIN_ENTRY_HIT_PROB
         - Records exact start timestamps
         - Persists fresh state to live_trading_state.json
         """
@@ -726,13 +854,17 @@ class MultiPeriodTradingManager:
             tr.last_signal_direction = None
             tr.last_signal_hit_prob = None
             tr.active_alert = None
+            tr.last_alert_signature = None
+            tr.last_alert_time = None
+            tr.recent_alert_times = {}
+            tr.reentry_blocked_until = None
             tr.trade_history = []
             tr.equity_history = [{
                 "timestamp": now.strftime("%m-%d %H:%M"),
                 "equity_usdt": 1000.0
             }]
-            # Open brand new 4x leveraged trade starting from this exact time
-            tr.open_new_trade(self.latest_live_price, now)
+            tr.live_hit_prob = None
+            # Fresh trade opens on its own once hit prob > MIN_ENTRY_HIT_PROB
 
         self.save_state()
         print("[+] All periods successfully reset to 1,000.00 USDT with exact start timestamps.")
@@ -764,6 +896,10 @@ class MultiPeriodTradingManager:
                             tr.live_prob_down = data.get("live_prob_down")
                             tr.live_confidence = data.get("live_confidence")
                             tr.active_alert = data.get("active_alert")
+                            tr.last_alert_time = _parse_state_datetime(data.get("last_alert_time"))
+                            tr.reentry_blocked_until = _parse_state_datetime(data.get("reentry_blocked_until"))
+                            sig = data.get("last_alert_signature")
+                            tr.last_alert_signature = tuple(sig) if isinstance(sig, (list, tuple)) and len(sig) == 4 else None
                             if data.get("active_trade"):
                                 tr.active_trade = data["active_trade"]
                             if tr.active_trade:
@@ -808,6 +944,9 @@ class MultiPeriodTradingManager:
                         "live_prob_down": tr.live_prob_down,
                         "live_confidence": tr.live_confidence,
                         "active_alert": tr.active_alert,
+                        "last_alert_signature": list(tr.last_alert_signature) if tr.last_alert_signature else None,
+                        "last_alert_time": tr.last_alert_time.isoformat() if tr.last_alert_time else None,
+                        "reentry_blocked_until": tr.reentry_blocked_until.isoformat() if tr.reentry_blocked_until else None,
                         "trade_history": tr.trade_history[-25:],
                         "equity_history": tr.equity_history[-50:]
                     }
@@ -874,11 +1013,34 @@ async def background_market_watcher(poll_interval: float = 2.5):
     evaluates liquidations, and closes/opens period trades.
     Synchronizes GDELT news and Binance candles every 15 minutes.
     Evaluates live directional signals & hit probabilities every 30 seconds.
+    Refreshes every period's model from the growing historical database every
+    MODEL_RETRAIN_INTERVAL_HOURS (and once shortly after startup).
     """
     print("[*] Started background market watcher loop...")
     manager.is_running = True
     tick_count = 0
     _evaluating_live_signals = False
+    _retraining = False
+    # Seed from the oldest period artifact's training time. If all artifacts
+    # are already fresh (e.g. just retrained via --train-all-periods) the first
+    # background refresh waits the full interval. A stale/missing artifact
+    # yields 0.0, forcing a refresh shortly after startup on fresh installs.
+    def _artifact_freshness_ts() -> float:
+        try:
+            import joblib
+            from config import LIVE_PERIOD_X_DAYS
+            from train import get_x_period_artifact_path
+            stamps = []
+            for x_days in LIVE_PERIOD_X_DAYS.values():
+                path = get_x_period_artifact_path(x_days)
+                if not os.path.exists(path):
+                    return 0.0
+                stamps.append(float(joblib.load(path).get("trained_at", 0.0)))
+            return min(stamps) if stamps else 0.0
+        except Exception:
+            return 0.0
+
+    _last_retrain_ts = _artifact_freshness_ts()
 
     async def _run_live_eval(price: float, dt: datetime):
         nonlocal _evaluating_live_signals
@@ -888,6 +1050,18 @@ async def background_market_watcher(poll_interval: float = 2.5):
             print(f"[!] Live signal eval error: {e}")
         finally:
             _evaluating_live_signals = False
+
+    async def _run_period_retrain():
+        nonlocal _retraining
+        _retraining = True
+        try:
+            from train import train_all_periods
+            await asyncio.to_thread(train_all_periods)
+            print("[+] All period models refreshed from the historical database.")
+        except Exception as e:
+            print(f"[!] Periodic model retrain failed: {e}")
+        finally:
+            _retraining = False
 
     while manager.is_running:
         try:
@@ -908,6 +1082,13 @@ async def background_market_watcher(poll_interval: float = 2.5):
                     await asyncio.to_thread(sync_latest_market_and_news_data)
                 except Exception as sync_err:
                     print(f"[!] Background sync error: {sync_err}")
+
+            # Retrain all period models from the full history. First run is
+            # delayed a few ticks so the server is up and data is available.
+            if (not _retraining and tick_count >= 5 and
+                    time.time() - _last_retrain_ts >= MODEL_RETRAIN_INTERVAL_HOURS * 3600):
+                _last_retrain_ts = time.time()
+                asyncio.create_task(_run_period_retrain())
 
         except Exception as e:
             print(f"[!] Error in market watcher loop: {e}")

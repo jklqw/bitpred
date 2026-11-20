@@ -54,28 +54,94 @@ Each news article is tagged with a primary category and secondary tags based on 
 ## 3. CLI Commands & Options
 
 ```bash
-# 1. Fetch 5,000 historical BTC candles (~7 months of continuous hourly data)
-.venv/bin/python3 main.py --fetch-btc 5000
+# 0. Initialize the database (only needed for a fresh install)
+.venv/bin/python3 main.py --init-db
 
-# 2. Ingest 24 hourly sampled GDELT batches across the past 24 hours (with finance filter)
-.venv/bin/python3 main.py --news-sample-hours 24 --filter-finance
+# 1. Backfill 2 YEARS of hourly BTC candles (17,532 bars) for training
+.venv/bin/python3 main.py --backfill-btc-years 2
 
-# 3. View database summary, date ranges, and category breakdown
+# 2. Backfill 2 YEARS of GDELT news (fast export files, one per 6h, resumable)
+#    Produces a multi-million-row sentiment database; re-run to continue after interruption.
+.venv/bin/python3 main.py --backfill-news-days 730 --news-source export \
+    --news-interval-hours 6 --news-workers 8
+
+#    Optional: rich GKG-format backfill (title/themes/tone, ~10x slower)
+.venv/bin/python3 main.py --backfill-news-days 730 --news-source gkg --news-interval-hours 24
+
+# 3. Train ALL five live-period models (3h/6h/12h/1d/3d) from the full history
+.venv/bin/python3 main.py --train-all-periods
+
+#    One-shot setup: init + BTC + news + stats + all period models
+.venv/bin/python3 main.py --all
+
+# 4. View database summary and verify news/BTC date ranges
 .venv/bin/python3 main.py --stats
 
-# 4. Train models with 1-hour prediction horizon and feature coverage diagnostics
+# 5. Train the classic 1-hour model with diagnostics
 .venv/bin/python3 main.py --train --horizon 1 --diagnose-features
 
-# 5. Train models with 4-hour prediction horizon
-.venv/bin/python3 main.py --train --horizon 4
-
-# 6. Real-time Live Signal: Check BUY, SELL, or WAIT recommendation right now
+# 6. Real-time live signal (uses the matching period model; retrains if stale)
 .venv/bin/python3 main.py --signal
-.venv/bin/python3 main.py --signal --horizon 4
 
 # 7. Export database tables to CSV
 .venv/bin/python3 main.py --export-csv
 ```
+
+> **Automatic updates**: while `web_server.py` is running, every period model is
+> retrained from the accumulated BTC/news history once per 24 hours (configurable
+> via `MODEL_RETRAIN_INTERVAL_HOURS` in `config.py`). Fresh news and candles are
+> synced every 15 minutes, so each daily refresh includes them. You can also
+> retrain at any time with `main.py --train-all-periods`. Signal evaluation never
+> blocks on training; it only trains a model if its artifact is completely missing.
+
+---
+
+## 3b. Server deployment (recommended)
+
+`bootstrap.py` is the production entry point. It runs four resumable phases:
+**init DB → 2-year BTC backfill → 2-year news backfill → initial training of all
+five live-period models**. If it is interrupted (SIGTERM, reboot, crash), simply
+run it again: completed GDELT files are skipped via `ingestion_progress`, BTC is
+upserted, and already-fresh model artifacts are not retrained unnecessarily.
+
+```bash
+# Foreground (monitor in tmux/screen)
+./run_server.sh                       # bootstrap, then exec the live web server
+
+# Background (survives logout)
+nohup ./run_server.sh > data/bootstrap.log 2>&1 &
+
+# Download + train only, do NOT start the web server
+.venv/bin/python3 bootstrap.py
+
+# Download + train only, force a retrain even if artifacts are fresh
+.venv/bin/python3 bootstrap.py --force-train
+
+# Check progress at any time
+.venv/bin/python3 bootstrap.py --status
+# or: tail -f data/bootstrap.log
+```
+
+State files:
+* `data/bootstrap_status.json` — current phase, DB date ranges, per-file progress, per-period training results.
+* `data/bootstrap.log` — timestamped log of every run.
+* `data/bootstrap.lock` — prevents two bootstrap instances from racing.
+
+### systemd service
+
+A ready-to-use unit is in `deploy/bitpred.service`:
+
+```bash
+sudo mkdir -p /opt/bitpred && sudo cp -r . /opt/bitpred   # copy the project
+sudo nano /opt/bitpred/deploy/bitpred.service            # set User= and WorkingDirectory=
+sudo cp /opt/bitpred/deploy/bitpred.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now bitpred
+journalctl -u bitpred -f                                 # follow progress
+```
+
+The service restarts automatically on failure, so an interrupted backfill
+resumes from its last checkpoint on the next start.
 
 ---
 
@@ -165,6 +231,7 @@ The system features an always-active web server running 5 parallel time-horizon 
 ```bash
 # Start background web server dashboard
 python3 web_server.py                  # Open http://localhost:8000
+python3 generate_html.py --watch       # Server-less alternative: writes static site/index.html + status.json (serve with any static file server)
 
 # Reset all 5 strategies to 1,000 USDT with exact start timestamps
 python3 reset.py

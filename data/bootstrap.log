@@ -1,0 +1,10 @@
+[2026-11-20T08:19:08.637549+00:00] [*] Bootstrap starting (PID 254978), DB=/home/vbnm/Downloads/archive/bitpred/data/crypto_news_alpha.db
+[2026-11-20T08:19:08.638078+00:00] === Phase: init_db ===
+[2026-11-20T08:19:09.383063+00:00] [+] Database schema ready.
+[2026-11-20T08:19:09.383156+00:00] [+] Bootstrap finished successfully.
+[2026-11-20T08:20:49.177279+00:00] [*] Bootstrap starting (PID 256165), DB=/home/vbnm/Downloads/archive/bitpred/data/crypto_news_alpha.db
+[2026-11-20T08:20:49.178019+00:00] === Phase: init_db ===
+[2026-11-20T08:20:49.904146+00:00] [+] Database schema ready.
+[2026-11-20T08:20:49.904609+00:00] === Phase: btc_backfill ===
+[2026-11-20T08:22:14.052797+00:00] [+] BTC backfill phase complete.
+[2026-11-20T08:22:14.053331+00:00] === Phase: news_backfill ===

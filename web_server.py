@@ -64,7 +64,7 @@ async def get_period_detail(period_id: str):
 @app.post("/api/reset")
 async def reset_simulation():
     """Reset all period balances back to 1,000 USDT initial capital starting from right now."""
-    manager.reset_all(clean_start=True)
+    await asyncio.to_thread(manager.reset_all, clean_start=True)
     return JSONResponse(content={
         "status": "success",
         "message": "All 5 periods successfully reset to 1,000 USDT with exact start timestamps.",
@@ -77,7 +77,7 @@ async def reset_simulation():
 @app.get("/api/alerts")
 async def get_alerts():
     """Return live alert history and active alerts across all period strategies."""
-    active_alerts = [a for a in manager.alerts if not a.get("dismissed", False)]
+    active_alerts = list(reversed([a for a in manager.alerts if not a.get("dismissed", False)]))
     return JSONResponse(content={
         "status": "success",
         "active_alerts_count": len(active_alerts),
@@ -101,17 +101,16 @@ async def clear_all_alerts():
 async def dismiss_single_alert(alert_id: str):
     """Dismiss a specific alert by its ID."""
     dismissed = manager.dismiss_alert(alert_id)
+    if not dismissed:
+        raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
     return JSONResponse(content={
-        "status": "success" if dismissed else "not_found",
+        "status": "success",
         "alert_id": alert_id,
-        "message": f"Alert {alert_id} dismissed." if dismissed else "Alert not found."
+        "message": f"Alert {alert_id} dismissed."
     })
 
 
-@app.get("/", response_class=HTMLResponse)
-async def serve_dashboard():
-    """Serve the modern dark-themed live terminal dashboard."""
-    html_content = """<!DOCTYPE html>
+DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -902,6 +901,15 @@ async def serve_dashboard():
     let globalData = null;
     let currentTab = 'overview';
 
+    function escapeHtml(value) {
+      return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     async function fetchStatus() {
       try {
         const resp = await fetch('/api/status');
@@ -911,7 +919,7 @@ async def serve_dashboard():
         if (currentTab === 'overview') {
           renderOverview();
         } else if (currentTab === 'alerts') {
-          renderAlertsView();
+          await renderAlertsView();
         } else {
           renderDetailView(currentTab);
         }
@@ -947,15 +955,19 @@ async def serve_dashboard():
       // Update Top Dynamic Alert Banner
       const banner = document.getElementById('top-alert-banner');
       const alerts = globalData.alerts || [];
-      const activeAlerts = alerts.filter(a => !a.dismissed);
+      const activeAlerts = alerts.filter(a => a && !a.dismissed);
       if (activeAlerts.length > 0 && banner) {
         const topAlert = activeAlerts[0];
+        const priceAtAlert = Number(topAlert.price_at_alert) || 0;
+        const oldHitProb = Number(topAlert.old_hit_prob) || 0;
+        const newHitProb = Number(topAlert.new_hit_prob) || 0;
+        const probChangePct = Number(topAlert.prob_change_pct) || 0;
         banner.style.display = 'flex';
         document.getElementById('alert-banner-title').textContent = topAlert.title || '🚨 Direction Reversal Alert!';
         document.getElementById('alert-banner-desc').innerHTML = `
-          <strong>${topAlert.period_name}:</strong> Flipped from <strong>${topAlert.old_direction} (${topAlert.old_hit_prob}%)</strong> ➔ 
-          <strong style="color: ${topAlert.new_direction === 'LONG' ? 'var(--accent-green)' : 'var(--accent-red)'}; font-size: 14px;">${topAlert.new_direction} (${topAlert.new_hit_prob}% hit prob)</strong>! 
-          BTC Price: <strong>$${topAlert.price_at_alert.toLocaleString()}</strong> (${topAlert.prob_change_pct >= 0 ? '+' : ''}${topAlert.prob_change_pct}% prob shift).
+          <strong>${escapeHtml(topAlert.period_name)}:</strong> Flipped from <strong>${escapeHtml(topAlert.old_direction)} (${oldHitProb}%)</strong> ➔ 
+          <strong style="color: ${topAlert.new_direction === 'LONG' ? 'var(--accent-green)' : 'var(--accent-red)'}; font-size: 14px;">${escapeHtml(topAlert.new_direction)} (${newHitProb}% hit prob)</strong>! 
+          BTC Price: <strong>$${priceAtAlert ? priceAtAlert.toLocaleString() : '---'}</strong> (${probChangePct >= 0 ? '+' : ''}${probChangePct}% prob shift).
         `;
         banner.setAttribute('data-top-alert-id', topAlert.alert_id);
       } else if (banner) {
@@ -1025,7 +1037,7 @@ async def serve_dashboard():
           ${hasAlert ? `
             <div class="card-alert-badge">
               <span>🚨</span>
-              <span><strong>${p.active_alert.type === 'DIRECTION_REVERSAL' ? 'Direction Reversal' : 'Prob Swing'}:</strong> ${p.active_alert.old_direction} ➔ <span style="color: ${p.active_alert.new_direction === 'LONG' ? 'var(--accent-green)' : 'var(--accent-red)'}; font-weight: 800;">${p.active_alert.new_direction}</span> (${p.active_alert.new_hit_prob}% Hit Prob)</span>
+              <span><strong>${p.active_alert.type === 'DIRECTION_REVERSAL' ? 'Direction Reversal' : 'Prob Swing'}:</strong> ${escapeHtml(p.active_alert.old_direction)} ➔ <span style="color: ${p.active_alert.new_direction === 'LONG' ? 'var(--accent-green)' : 'var(--accent-red)'}; font-weight: 800;">${escapeHtml(p.active_alert.new_direction)}</span> (${Number(p.active_alert.new_hit_prob) || 0}% Hit Prob)</span>
             </div>
           ` : ''}
 
@@ -1173,11 +1185,11 @@ async def serve_dashboard():
               <div style="display: flex; align-items: center; gap: 10px;">
                 <span style="font-size: 22px;">🚨</span>
                 <div>
-                  <div style="font-size: 13px; font-weight: 800; color: #ff3b69;">${p.active_alert.title}</div>
-                  <div style="font-size: 12px; color: var(--text-main); margin-top: 2px;">${p.active_alert.message}</div>
+                  <div style="font-size: 13px; font-weight: 800; color: #ff3b69;">${escapeHtml(p.active_alert.title)}</div>
+                  <div style="font-size: 12px; color: var(--text-main); margin-top: 2px;">${escapeHtml(p.active_alert.message)}</div>
                 </div>
               </div>
-              <button onclick="dismissSingleAlert('${p.active_alert.alert_id}')" class="alert-btn-dismiss" style="padding: 4px 10px;">Dismiss</button>
+              <button onclick="dismissSingleAlert('${escapeHtml(p.active_alert.alert_id)}')" class="alert-btn-dismiss" style="padding: 4px 10px;">Dismiss</button>
             </div>
           ` : ''}
           <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -1400,11 +1412,21 @@ async def serve_dashboard():
       `;
     }
 
-    function renderAlertsView() {
+    async function renderAlertsView() {
       if (!globalData) return;
       const tbody = document.getElementById('alerts-tbody');
       tbody.innerHTML = '';
-      const alerts = globalData.alerts || [];
+      let alerts = globalData.alerts || [];
+      try {
+        const resp = await fetch('/api/alerts');
+        if (resp.ok) {
+          const data = await resp.json();
+          if (Array.isArray(data.alerts)) alerts = data.alerts;
+        }
+      } catch (e) {
+        console.error("Failed to fetch alert history, using status data:", e);
+      }
+      if (currentTab !== 'alerts') return;
 
       if (alerts.length === 0) {
         tbody.innerHTML = '<tr><td colspan="9" style="text-align: center; padding: 36px; color: var(--text-dim); font-size: 13px;">No alerts triggered yet.<br><span style="font-size: 11px;">Alerts trigger automatically when any period changes direction with significant hit probability or probability swings drastically.</span></td></tr>';
@@ -1412,27 +1434,32 @@ async def serve_dashboard():
       }
 
       alerts.forEach(a => {
+        if (!a) return;
         const isCrit = a.severity === 'CRITICAL';
         const row = document.createElement('tr');
         row.style.background = a.dismissed ? 'transparent' : 'rgba(255, 59, 105, 0.04)';
-        const probDiffStr = a.prob_change_pct >= 0 ? `+${a.prob_change_pct.toFixed(1)}%` : `${a.prob_change_pct.toFixed(1)}%`;
+        const oldHitProb = Number(a.old_hit_prob) || 0;
+        const newHitProb = Number(a.new_hit_prob) || 0;
+        const probChangePct = Number(a.prob_change_pct) || 0;
+        const priceAtAlert = Number(a.price_at_alert) || 0;
+        const probDiffStr = `${probChangePct >= 0 ? '+' : ''}${probChangePct.toFixed(1)}%`;
 
         row.innerHTML = `
-          <td class="mono" style="font-size: 11px; color: var(--text-dim); white-space: nowrap;">${a.timestamp}</td>
-          <td><strong style="text-transform: uppercase;">${a.period_name || a.period_id}</strong></td>
-          <td><span class="${isCrit ? 'badge-critical' : 'badge-warning'}">${a.severity}</span></td>
-          <td style="font-weight: 600; font-size: 12px;">${(a.type || '').replace('_', ' ')}</td>
+          <td class="mono" style="font-size: 11px; color: var(--text-dim); white-space: nowrap;">${escapeHtml(a.timestamp)}</td>
+          <td><strong style="text-transform: uppercase;">${escapeHtml(a.period_name || a.period_id)}</strong></td>
+          <td><span class="${isCrit ? 'badge-critical' : 'badge-warning'}">${escapeHtml(a.severity)}</span></td>
+          <td style="font-weight: 600; font-size: 12px;">${escapeHtml((a.type || '').replace('_', ' '))}</td>
           <td>
             <span class="mono" style="font-weight: 700;">
-              ${a.old_direction} (${a.old_hit_prob}%) ➔ <span style="color: ${a.new_direction === 'LONG' ? 'var(--accent-green)' : 'var(--accent-red)'}; font-weight: 800;">${a.new_direction} (${a.new_hit_prob}%)</span>
+              ${escapeHtml(a.old_direction)} (${oldHitProb}%) ➔ <span style="color: ${a.new_direction === 'LONG' ? 'var(--accent-green)' : 'var(--accent-red)'}; font-weight: 800;">${escapeHtml(a.new_direction)} (${newHitProb}%)</span>
             </span>
           </td>
-          <td class="mono" style="font-weight: 700; color: ${a.prob_change_pct >= 0 ? 'var(--accent-green)' : 'var(--accent-red)'};">${probDiffStr}</td>
-          <td class="mono">$${a.price_at_alert ? a.price_at_alert.toLocaleString() : '---'}</td>
-          <td style="font-size: 12px; max-width: 320px; color: var(--text-muted);">${a.message}</td>
+          <td class="mono" style="font-weight: 700; color: ${probChangePct >= 0 ? 'var(--accent-green)' : 'var(--accent-red)'};">${probDiffStr}</td>
+          <td class="mono">$${priceAtAlert ? priceAtAlert.toLocaleString() : '---'}</td>
+          <td style="font-size: 12px; max-width: 320px; color: var(--text-muted);">${escapeHtml(a.message)}</td>
           <td>
             ${!a.dismissed ? `
-              <button onclick="dismissSingleAlert('${a.alert_id}')" class="alert-btn-dismiss" style="padding: 4px 10px; font-size: 11px;">Dismiss</button>
+              <button onclick="dismissSingleAlert('${escapeHtml(a.alert_id)}')" class="alert-btn-dismiss" style="padding: 4px 10px; font-size: 11px;">Dismiss</button>
             ` : '<span style="font-size: 11px; color: var(--text-dim);">Dismissed</span>'}
           </td>
         `;
@@ -1522,8 +1549,13 @@ async def serve_dashboard():
   </script>
 </body>
 </html>
-    """
-    return HTMLResponse(content=html_content)
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_dashboard():
+    """Serve the modern dark-themed live terminal dashboard."""
+    return HTMLResponse(content=DASHBOARD_HTML)
 
 
 if __name__ == "__main__":

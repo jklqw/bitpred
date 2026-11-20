@@ -11,9 +11,10 @@ from config import (
     DEFAULT_INTERVAL,
     DEFAULT_LOOKBACK_CANDLES,
     BINANCE_CHUNK_SIZE,
-    BINANCE_RATE_LIMIT_SLEEP
+    BINANCE_RATE_LIMIT_SLEEP,
+    TRAINING_HISTORY_YEARS
 )
-from database import insert_btc_prices
+from database import insert_btc_prices, init_db
 
 
 def _interval_to_seconds(interval: str) -> int:
@@ -33,6 +34,15 @@ def _interval_to_seconds(interval: str) -> int:
     if interval not in mapping:
         raise ValueError(f"Unsupported interval: {interval}. Supported: {list(mapping.keys())}")
     return mapping[interval]
+
+
+def _drop_unclosed_klines(klines: List[list]) -> List[list]:
+    """Drop the still-forming candle (close time at/after now), unless it would leave <=1 candle."""
+    if len(klines) <= 1:
+        return klines
+    now_ms = int(time.time() * 1000)
+    closed = [item for item in klines if int(item[6]) < now_ms]
+    return closed if len(closed) > 1 else klines
 
 
 def fetch_binance_btc_klines_chunk(
@@ -57,13 +67,17 @@ def fetch_binance_btc_klines_chunk(
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                return data
+                return _drop_unclosed_klines(data)
         except urllib.error.HTTPError as e:
             if e.code == 429:
+                if attempt == max_retries - 1:
+                    raise
                 wait_time = (attempt + 1) * 3.0
                 print(f"  [!] Binance API rate-limit (429). Backing off for {wait_time:.1f}s...")
                 time.sleep(wait_time)
             elif e.code in (500, 502, 503, 504):
+                if attempt == max_retries - 1:
+                    raise
                 wait_time = (attempt + 1) * 2.0
                 print(f"  [!] Binance server error ({e.code}). Retrying in {wait_time:.1f}s...")
                 time.sleep(wait_time)
@@ -118,7 +132,9 @@ def fetch_paginated_btc_klines(
 
         print(f"  -> Retrieved {len(chunk)} candles. Progress: {len(all_raw_klines)}/{lookback_candles}")
 
-        if len(chunk) < chunk_limit:
+        # The first unbounded request includes the still-forming candle, which
+        # the fetcher drops, so a full page can legitimately be chunk_limit-1.
+        if len(chunk) < chunk_limit - 1:
             print("  [*] Reached the earliest available historical data on exchange.")
             break
 
@@ -202,3 +218,15 @@ def ingest_btc_market_data(
     summary["inserted_or_updated"] = inserted
     print(f"[*] Ingested {inserted} candles into database. Date range: {summary['date_start']} to {summary['date_end']}")
     return summary
+
+
+def ingest_btc_history(
+    years: float = TRAINING_HISTORY_YEARS,
+    interval: str = DEFAULT_INTERVAL,
+    db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """Backfill enough hourly candles to cover the requested training history."""
+    init_db(db_path=db_path)
+    candles = int(float(years) * 365.25 * 24)
+    print(f"[*] Backfilling {years:g} years of {interval} candles ({candles} bars)...")
+    return ingest_btc_market_data(interval=interval, lookback_candles=candles, db_path=db_path)

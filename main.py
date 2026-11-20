@@ -11,11 +11,18 @@ from config import (
     DEFAULT_PREDICTION_HORIZON,
     DEFAULT_TARGET_THRESHOLD,
     DEFAULT_TAKER_FEE,
-    DEFAULT_SLIPPAGE
+    DEFAULT_SLIPPAGE,
+    TRAINING_HISTORY_YEARS,
+    NEWS_HISTORY_DAYS,
+    NEWS_SAMPLE_INTERVAL_HOURS
 )
 from database import init_db, get_database_stats
-from gdelt_fetcher import ingest_recent_gdelt_news
-from btc_fetcher import ingest_btc_market_data
+from gdelt_fetcher import (
+    ingest_recent_gdelt_news,
+    ingest_gdelt_history,
+    ingest_export_history
+)
+from btc_fetcher import ingest_btc_market_data, ingest_btc_history
 
 
 def run_stats():
@@ -208,8 +215,22 @@ def main():
                         help="Output direct BUY or SELL action recommendation right now for the configured X-day period")
     parser.add_argument("--signal", "--predict-now", action="store_true", dest="signal",
                         help="Analyze current live market data & news and output BUY, SELL, or WAIT recommendation")
+    parser.add_argument("--backfill-btc-years", type=float,
+                        help=f"Backfill BTC candles for N years of training history (default: {TRAINING_HISTORY_YEARS})")
+    parser.add_argument("--backfill-news-days", type=int,
+                        help=f"Backfill GDELT news for N days (default: {NEWS_HISTORY_DAYS}); resumable")
+    parser.add_argument("--news-interval-hours", type=int, default=NEWS_SAMPLE_INTERVAL_HOURS,
+                        help=f"Sample one GKG file per N hours during news backfill (default: {NEWS_SAMPLE_INTERVAL_HOURS})")
+    parser.add_argument("--news-source", choices=("export", "gkg"), default="export",
+                        help="Historical news source: export (fast, ~80KB/file) or gkg (rich, ~3.6MB/file)")
+    parser.add_argument("--news-workers", type=int, default=8,
+                        help="Parallel download workers for GDELT backfill (default: 8)")
+    parser.add_argument("--no-resume-news", action="store_true",
+                        help="Re-download backfilled GKG files instead of skipping completed ones")
+    parser.add_argument("--train-all-periods", action="store_true",
+                        help="Train and update a separate model for 3h, 6h, 12h, 1d and 3d from full history")
     parser.add_argument("--all", action="store_true",
-                        help="Run full end-to-end pipeline: init, fetch BTC (5000), fetch news, report stats, and train")
+                        help="Run full end-to-end pipeline: init, fetch BTC + 2y news, report stats and train all periods")
 
     args = parser.parse_args()
 
@@ -222,16 +243,35 @@ def main():
         init_db()
         print("[+] Database initialized successfully.")
 
-    if args.fetch_btc is not None or args.all:
+    if args.backfill_btc_years is not None:
+        ingest_btc_history(years=args.backfill_btc_years, interval=DEFAULT_INTERVAL)
+    elif args.fetch_btc is not None or args.all:
         lookback = args.fetch_btc if args.fetch_btc is not None else DEFAULT_LOOKBACK_CANDLES
         ingest_btc_market_data(interval=DEFAULT_INTERVAL, lookback_candles=lookback)
 
-    if args.news_sample_hours is not None:
+    if args.backfill_news_days is not None or args.all:
+        backfill_days = args.backfill_news_days if args.backfill_news_days is not None else NEWS_HISTORY_DAYS
+        if args.news_source == "export":
+            ingest_export_history(
+                days=backfill_days,
+                interval_hours=args.news_interval_hours,
+                resume=not args.no_resume_news,
+                workers=args.news_workers
+            )
+        else:
+            ingest_gdelt_history(
+                days=backfill_days,
+                interval_hours=args.news_interval_hours,
+                filter_crypto_finance=args.filter_finance,
+                resume=not args.no_resume_news,
+                workers=args.news_workers
+            )
+    elif args.news_sample_hours is not None:
         ingest_recent_gdelt_news(
             sample_hours=args.news_sample_hours,
             filter_crypto_finance=args.filter_finance
         )
-    elif args.fetch_news is not None or args.all:
+    elif args.fetch_news is not None:
         batches = args.fetch_news if args.fetch_news is not None else 4
         ingest_recent_gdelt_news(
             num_batches=batches,
@@ -244,7 +284,10 @@ def main():
     if args.export_csv:
         run_export()
 
-    if args.train or args.all:
+    if args.train_all_periods or args.all:
+        from train import train_all_periods
+        train_all_periods(taker_fee=args.taker_fee, slippage=args.slippage)
+    elif args.train:
         run_train(args)
 
     if args.action or (args.signal and args.x_days is not None):
@@ -256,6 +299,13 @@ def main():
         from trading_engine import manager, fetch_live_btc_price_fast
         live_p = fetch_live_btc_price_fast()
         manager.process_tick(live_p)
+        # Refresh live signals/alerts before printing — process_tick only updates
+        # collateral and liquidation checks, so without this the CLI shows stale
+        # probabilities and alerts from the last web-server evaluation.
+        try:
+            manager.update_live_signals(live_p, manager.last_update_utc)
+        except Exception as e:
+            print(f"[!] Live signal evaluation failed; showing last known state: {e}")
         print("\n" + "═" * 86)
         print("     ⚡ BITCOIN MULTI-PERIOD ACTION RECOMMENDATION (LIVE SERVER ENGINE)")
         print("═" * 86)

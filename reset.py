@@ -4,6 +4,7 @@
 import sys
 import json
 import urllib.request
+import urllib.error
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -17,28 +18,29 @@ if str(BASE_DIR) not in sys.path:
 
 
 def reset_trading_server():
+    from config import MIN_ENTRY_HIT_PROB
+
     server_port = 8000
     server_url = f"http://127.0.0.1:{server_port}/api/reset"
     server_running = False
 
-    # Check if web server is currently running
+    # Prefer the live server: a running web_server keeps its own in-memory
+    # manager and would otherwise overwrite a disk-only reset within 2.5s.
     try:
-        req = urllib.request.Request(server_url, data=b"", headers={"User-Agent": "BTC-Reset-CLI"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        req = urllib.request.Request(
+            server_url,
+            data=b"",
+            method="POST",
+            headers={"User-Agent": "BTC-Reset-CLI"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            server_running = True
-            exact_time = data.get("exact_start_time_utc", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
-            btc_price = data.get("live_btc_price", 0.0)
-            portfolio = data.get("portfolio", {})
-    except urllib.error.URLError as e:
-        # Fallback to direct engine reset if server is not running
-        from trading_engine import manager
-        manager.reset_all(clean_start=True)
-        exact_time = manager.last_update_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
-        btc_price = manager.latest_live_price
-        portfolio = manager.get_full_dashboard_data()
+        server_running = True
+        exact_time = data.get("exact_start_time_utc", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+        btc_price = data.get("live_btc_price", 0.0)
+        portfolio = data.get("portfolio", {})
     except Exception as e:
-        # Fallback to direct engine reset
+        print(f"[!] Live dashboard not reachable ({e}); resetting persisted engine state directly.")
         from trading_engine import manager
         manager.reset_all(clean_start=True)
         exact_time = manager.last_update_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -56,7 +58,7 @@ def reset_trading_server():
     if server_running:
         print("  🟢 Server Status           : Active & Synchronized with Web Dashboard")
     else:
-        print("  🟡 Note                    : Saved to disk. Start web server with: python3 web_server.py")
+        print("  🟡 Note                    : Saved to disk. (Re)start web server with: python3 web_server.py")
     print("─" * 86)
     print(f"  {'PERIOD':<8} {'DIR':<10} {'ENTRY (+/-0.01%)':<18} {'LIQUIDATION':<16} {'FEE DEDUCTED':<16} {'HIT PROB':<10} {'CONFIDENCE'}")
     print("─" * 86)
@@ -69,12 +71,14 @@ def reset_trading_server():
             dir_str = t.get("direction_icon", t.get("direction"))
             entry_str = f"${t.get('entry_price', 0):,.2f}"
             liq_str = f"${t.get('liquidation_price', 0):,.2f}"
-            fee_val = t.get('fee_deducted_usdt', t.get('fee_usdt', 0))
+            fee_val = t.get("fee_deducted_usdt", t.get("fee_usdt", 0))
             fee_str = f"${fee_val:,.2f} USDT"
             hit_prob = t.get("hit_probability_pct", t.get("prob_up" if "LONG" in dir_str else "prob_down", 50.0))
             hit_str = f"{hit_prob:.1f}%"
             conf_str = t.get("confidence", "Moderate")
             print(f"  {pid.upper():<8} {dir_str:<10} {entry_str:<18} {liq_str:<16} {fee_str:<16} {hit_str:<10} {conf_str}")
+        else:
+            print(f"  {pid.upper():<8} waiting for signal: trade opens when hit prob > {MIN_ENTRY_HIT_PROB:g}%")
 
     print("═" * 86)
     print("  All past trades have been wiped. Monitoring and live PnL begin from this exact second.\n")

@@ -1,0 +1,20 @@
+[Unit]
+Description=BitPred live trading dashboard with resumable data bootstrap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# TODO: set to the user that owns /opt/bitpred on your server.
+User=CHANGE_ME
+WorkingDirectory=/opt/bitpred
+Environment=PORT=8000
+ExecStart=/opt/bitpred/run_server.sh
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=120
+StandardOutput=append:/opt/bitpred/data/bootstrap.log
+StandardError=append:/opt/bitpred/data/bootstrap.log
+
+[Install]
+WantedBy=multi-user.target
